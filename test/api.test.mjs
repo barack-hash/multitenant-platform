@@ -240,14 +240,20 @@ test('minor: subject-level erasure removes the student + their files (tenant int
   eq(r.statusCode, 404, '...but the erased student is gone');
 });
 
-// ---- group 9: TENANT-level offboarding lifecycle (admin-gated; runs on the dedicated tenant-three) ----
-const adminHdr = { 'x-admin-token': 'dev-admin-token' };
+// ---- group 11 setup: log in DISTINCT operators (real per-operator auth replaces the shared token) ----
+const loginOp = (email, api_key) => app.inject({ method: 'POST', url: '/operator/login', payload: { email, api_key } }).then((r) => r.json().operator_token);
+const opsTok = await loginOp('ops1@platform.example', 'opk_op3_key_cccccccc');       // ops role
+const supTokA = await loginOp('support1@platform.example', 'opk_op1_key_aaaaaaaa');   // support (requester)
+const supTokB = await loginOp('support2@platform.example', 'opk_op2_key_bbbbbbbb');   // support (approver)
+
+// ---- group 9: TENANT-level offboarding lifecycle (operator-gated, ops role; dedicated tenant-three) ----
+const adminHdr = bearer(opsTok);
 const advance = (id, to) => app.inject({ method: 'POST', url: `/admin/offboarding/${id}/advance`, headers: adminHdr, payload: { to } });
 let obJobId;
 
-test('offboarding: the /admin surface rejects a missing/wrong admin token (401)', async () => {
-  eq((await app.inject({ method: 'POST', url: '/admin/offboarding/start', payload: { tenant: 'tenant-three' } })).statusCode, 401, 'no admin token');
-  eq((await app.inject({ method: 'POST', url: '/admin/offboarding/start', headers: { 'x-admin-token': 'wrong' }, payload: { tenant: 'tenant-three' } })).statusCode, 401, 'wrong admin token');
+test('offboarding: the /admin surface rejects a missing/invalid operator token (401)', async () => {
+  eq((await app.inject({ method: 'POST', url: '/admin/offboarding/start', payload: { tenant: 'tenant-three' } })).statusCode, 401, 'no operator token');
+  eq((await app.inject({ method: 'POST', url: '/admin/offboarding/start', headers: bearer('garbage.token'), payload: { tenant: 'tenant-three' } })).statusCode, 401, 'invalid operator token');
 });
 
 test('offboarding: start creates a requested job for the tenant', async () => {
@@ -311,33 +317,35 @@ test('offboarding: blast radius is one tenant — tenant-one is unaffected', asy
 // ---- group 10: support/impersonation + platform-ops + Tier-A audit (operator-gated) ----
 const OP1 = '0b000000-0000-0000-0000-000000000001'; // requester operator
 const OP2 = '0b000000-0000-0000-0000-000000000002'; // approver operator
-const sreq = (body) => app.inject({ method: 'POST', url: '/admin/support/request', headers: adminHdr, payload: body });
+const sreq = (body) => app.inject({ method: 'POST', url: '/admin/support/request', headers: bearer(supTokA), payload: body });
 let supTok;
 
-test('support: /admin surface rejects a missing admin token (401)', async () => {
-  eq((await app.inject({ method: 'POST', url: '/admin/support/request', payload: { tenant: 'tenant-one', requested_by: OP1, reason: 'x' } })).statusCode, 401, 'no admin token');
+test('support: /admin surface rejects a missing operator token (401)', async () => {
+  eq((await app.inject({ method: 'POST', url: '/admin/support/request', payload: { tenant: 'tenant-one', reason: 'x' } })).statusCode, 401, 'no operator token');
 });
 
-test('support: dual-control — an operator cannot approve their own request (409)', async () => {
-  const id = (await sreq({ tenant: 'tenant-one', requested_by: OP1, target_email: 'u3@example.com', reason: 'debug' })).json().support_access_request_id;
-  const r = await app.inject({ method: 'POST', url: `/admin/support/request/${id}/approve`, headers: adminHdr, payload: { approver: OP1 } });
+test('support: dual-control — an operator cannot approve their OWN request (409)', async () => {
+  const id = (await sreq({ tenant: 'tenant-one', target_email: 'u3@example.com', reason: 'debug' })).json().support_access_request_id;
+  // Approve with the SAME operator's token → the approver is derived as op1 == requester → self-approval.
+  const r = await app.inject({ method: 'POST', url: `/admin/support/request/${id}/approve`, headers: bearer(supTokA) });
   eq(r.statusCode, 409, 'self-approval blocked'); eq(r.json().error, 'SELF_APPROVAL_DENIED', 'code');
 });
 
 test('support: cannot impersonate an un-approved request (409, audited denial)', async () => {
-  const id = (await sreq({ tenant: 'tenant-one', requested_by: OP1, target_email: 'u3@example.com', reason: 'debug' })).json().support_access_request_id;
-  const r = await app.inject({ method: 'POST', url: '/admin/support/impersonate', headers: adminHdr, payload: { request_id: id } });
+  const id = (await sreq({ tenant: 'tenant-one', target_email: 'u3@example.com', reason: 'debug' })).json().support_access_request_id;
+  const r = await app.inject({ method: 'POST', url: '/admin/support/impersonate', headers: bearer(supTokB), payload: { request_id: id } });
   eq(r.statusCode, 409, 'not approved'); eq(r.json().error, 'SUPPORT_REQUEST_NOT_APPROVED', 'code');
 });
 
-test('support: approve → impersonate issues a READ-ONLY token with a banner signal', async () => {
-  const id = (await sreq({ tenant: 'tenant-one', requested_by: OP1, target_email: 'u3@example.com', reason: 'debug', ttl_seconds: 900 })).json().support_access_request_id;
-  eq((await app.inject({ method: 'POST', url: `/admin/support/request/${id}/approve`, headers: adminHdr, payload: { approver: OP2 } })).statusCode, 200, 'approved by other op');
-  const imp = await app.inject({ method: 'POST', url: '/admin/support/impersonate', headers: adminHdr, payload: { request_id: id } });
+test('support: approve (by a DISTINCT operator) → impersonate issues a READ-ONLY token + banner', async () => {
+  const id = (await sreq({ tenant: 'tenant-one', target_email: 'u3@example.com', reason: 'debug', ttl_seconds: 900 })).json().support_access_request_id;
+  // op2's token approves op1's request — a genuine second authenticated human.
+  eq((await app.inject({ method: 'POST', url: `/admin/support/request/${id}/approve`, headers: bearer(supTokB) })).statusCode, 200, 'approved by a distinct operator');
+  const imp = await app.inject({ method: 'POST', url: '/admin/support/impersonate', headers: bearer(supTokB), payload: { request_id: id } });
   eq(imp.statusCode, 200, 'impersonate'); supTok = imp.json().support_token;
   eq(imp.json().banner_required, true, 'banner required');
   const ctx = await app.inject({ method: 'GET', url: '/support/session', headers: bearer(supTok) });
-  eq(ctx.statusCode, 200, 'context'); eq(ctx.json().impersonating, true, 'impersonating'); eq(ctx.json().operator, OP1, 'operator carried');
+  eq(ctx.statusCode, 200, 'context'); eq(ctx.json().impersonating, true, 'impersonating'); eq(ctx.json().operator, OP1, 'requester operator carried');
 });
 
 test('support: impersonation is READ-ONLY — reads work, writes are denied even with the permission', async () => {
@@ -373,15 +381,15 @@ test('support: ending the impersonation session revokes the underlying session',
 });
 
 test('support: read_write impersonation is rejected in MVP (mode never diverges from enforcement)', async () => {
-  const r = await sreq({ tenant: 'tenant-one', requested_by: OP1, target_email: 'u3@example.com', reason: 'debug', mode: 'read_write' });
+  const r = await sreq({ tenant: 'tenant-one', target_email: 'u3@example.com', reason: 'debug', mode: 'read_write' });
   eq(r.statusCode, 400, 'read_write rejected'); eq(r.json().error, 'MODE_UNSUPPORTED', 'code');
 });
 
 test('support: impersonating a user with no membership in the tenant is denied AND audited (§12)', async () => {
   // u2 belongs to tenant-two only → no active membership in tenant-one.
-  const id = (await sreq({ tenant: 'tenant-one', requested_by: OP1, target_email: 'u2@example.com', reason: 'debug' })).json().support_access_request_id;
-  eq((await app.inject({ method: 'POST', url: `/admin/support/request/${id}/approve`, headers: adminHdr, payload: { approver: OP2 } })).statusCode, 200, 'approved');
-  const imp = await app.inject({ method: 'POST', url: '/admin/support/impersonate', headers: adminHdr, payload: { request_id: id } });
+  const id = (await sreq({ tenant: 'tenant-one', target_email: 'u2@example.com', reason: 'debug' })).json().support_access_request_id;
+  eq((await app.inject({ method: 'POST', url: `/admin/support/request/${id}/approve`, headers: bearer(supTokB) })).statusCode, 200, 'approved');
+  const imp = await app.inject({ method: 'POST', url: '/admin/support/impersonate', headers: bearer(supTokB), payload: { request_id: id } });
   eq(imp.statusCode, 404, 'no-membership impersonation denied');
   const tail = await app.inject({ method: 'GET', url: '/admin/audit/tail?chain=tenant-one', headers: adminHdr });
   if (!tail.json().events.some((e) => e.reason_code === 'NO_ACTIVE_MEMBERSHIP')) throw new Error('the denied attempt was not audited');
@@ -394,6 +402,28 @@ test('support: an operator can anchor a chain head (§16 Tier-A periodic anchori
   eq(a2.json().anchor_id, a1.json().anchor_id, 're-anchoring the same head is idempotent');
   // anchoring did not mutate the ledger — the chain still verifies clean.
   eq((await app.inject({ method: 'GET', url: '/admin/audit/verify?chain=tenant-one', headers: adminHdr })).json().ok, true, 'chain still verifies after anchor');
+});
+
+// ---- group 11: per-operator platform-ops auth ----
+test('operator: bad key is 401 (audited); good key issues an operator token with its role', async () => {
+  eq((await app.inject({ method: 'POST', url: '/operator/login', payload: { email: 'ops1@platform.example', api_key: 'opk_op3_key_WRONGXX' } })).statusCode, 401, 'bad key rejected');
+  const good = await app.inject({ method: 'POST', url: '/operator/login', payload: { email: 'ops1@platform.example', api_key: 'opk_op3_key_cccccccc' } });
+  eq(good.statusCode, 200, 'good key'); eq(good.json().operator_role, 'ops', 'role carried'); if (!good.json().operator_token) throw new Error('no operator token');
+});
+
+test('operator: role gating — a SUPPORT operator cannot drive destructive lifecycle (403)', async () => {
+  const denied = await app.inject({ method: 'POST', url: '/admin/offboarding/start', headers: bearer(supTokA), payload: { tenant: 'tenant-one' } });
+  eq(denied.statusCode, 403, 'support role denied offboarding'); eq(denied.json().error, 'OPERATOR_ROLE_REQUIRED', 'code');
+});
+
+test('operator: break-glass is OFF by default → the shared admin token is rejected', async () => {
+  eq((await app.inject({ method: 'GET', url: '/admin/audit/verify?chain=platform', headers: { 'x-admin-token': 'dev-admin-token' } })).statusCode, 401, 'shared token rejected when break-glass disabled');
+});
+
+test('operator: logout revokes the session → the token is immediately rejected', async () => {
+  const tok = await loginOp('support2@platform.example', 'opk_op2_key_bbbbbbbb');
+  eq((await app.inject({ method: 'POST', url: '/operator/logout', headers: bearer(tok) })).json().revoked, 1, 'logout revokes the session');
+  eq((await app.inject({ method: 'GET', url: '/admin/audit/tail?chain=platform', headers: bearer(tok) })).statusCode, 401, 'revoked token no longer authenticates');
 });
 
 let pass = 0, fail = 0;

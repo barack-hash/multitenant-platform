@@ -50,6 +50,18 @@ export function verifyHubToken(token) {
   return jwt.verify(token, cfg.jwtSecret, { algorithms: ['HS256'], issuer: cfg.iss, audience: cfg.aud });
 }
 
+// Operator token (group 11): authenticates a PLATFORM OPERATOR (not a tenant user) for /admin/*.
+// aud='operator'; bound to a live operator_session (osid) so revocation kills it before expiry.
+export function mintOperatorToken({ operator_id, operator_role, osid, ttlSec = cfg.operatorTokenTtlSec }) {
+  return jwt.sign(
+    { ver: 1, jti: randomUUID(), actor_type: 'operator', orole: operator_role, osid },
+    cfg.jwtSecret,
+    { algorithm: 'HS256', subject: operator_id, issuer: cfg.iss, audience: 'operator', expiresIn: ttlSec }
+  );
+}
+export const verifyOperatorToken = (t) =>
+  jwt.verify(t, cfg.jwtSecret, { algorithms: ['HS256'], issuer: cfg.iss, audience: 'operator' });
+
 // Map verified token claims to the DB context GUCs the RLS helpers read.
 export function gucsFromClaims(c) {
   const g = {

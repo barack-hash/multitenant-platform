@@ -6,7 +6,8 @@ import { dirname, join } from 'node:path';
 import { randomUUID, createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { withUserContext, withServiceContext } from './db.js';
 import { mintHubToken, verifyHubToken, gucsFromClaims,
-         mintLaunchToken, verifyLaunchToken, mintSpokeToken, verifySpokeToken, mintSupportToken } from './tokens.js';
+         mintLaunchToken, verifyLaunchToken, mintSpokeToken, verifySpokeToken, mintSupportToken,
+         mintOperatorToken, verifyOperatorToken } from './tokens.js';
 import { cfg } from './config.js';
 
 const sha256 = (s) => createHash('sha256').update(s).digest('hex');
@@ -405,14 +406,45 @@ export function buildServer() {
     return { erased: Number(n.rows[0].n) };
   });
 
-  // ---- group 9: TENANT-level offboarding lifecycle (MASTER_PLAN §13/§10/§15) ----
-  // Platform-operator surface, gated by an admin token OUT-OF-BAND from tenant JWTs. DB writes run as
-  // svc_lifecycle. Distinct from group-8 subject-level erasure: this offboards a WHOLE tenant.
+  // ---- group 11: per-operator platform-ops auth (FOUNDATION_10) ----
+  // Every /admin/* call carries an OPERATOR token (aud='operator') bound to a live operator_session; the
+  // acting operator is taken from the token, never the body — so §12 dual-control is a true two-person
+  // control. The shared admin token survives ONLY as an env-gated (default OFF), audited break-glass.
+  // (auditAppend is defined further below; it is only referenced at request time, so ordering is fine.)
+  const BREAKGLASS_OP = '0b000000-0000-0000-0000-0000000000ff';
+  const operatorLive = (osid) => withServiceContext('svc_ops', (c) =>
+    c.query('select app.assert_operator_session_live($1) live', [osid])).then((r) => r.rows[0].live);
 
-  const adminAuth = async (req, reply) => {
-    if ((req.headers['x-admin-token'] || '') !== cfg.adminToken)
-      return reply.code(401).send({ error: 'admin token required' });
+  const operatorAuth = async (req, reply) => {
+    const m = /^Bearer (.+)$/.exec(req.headers.authorization || '');
+    if (m) {
+      let claims; try { claims = verifyOperatorToken(m[1]); } catch { return reply.code(401).send({ error: 'invalid operator token' }); }
+      if (!(await operatorLive(claims.osid))) return reply.code(401).send({ error: 'OPERATOR_SESSION_INACTIVE' });
+      req.operator = { id: claims.sub, role: claims.orole, osid: claims.osid };
+      return;
+    }
+    if (req.headers['x-admin-token']) {                       // break-glass (env-gated, loudly audited)
+      if (cfg.breakGlassEnabled && req.headers['x-admin-token'] === cfg.adminToken) {
+        req.operator = { id: BREAKGLASS_OP, role: 'admin', breakglass: true };
+        await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.breakglass.used',
+          actor_ref: BREAKGLASS_OP, resource_type: 'endpoint', resource_ref: req.url, outcome: 'success', reason_code: 'BREAKGLASS' });
+        return;
+      }
+      return reply.code(401).send({ error: 'BREAKGLASS_DISABLED' });
+    }
+    return reply.code(401).send({ error: 'operator authentication required' });
   };
+
+  // Role-matrix guard: call at the top of a handler. Audits the denial (§12) and 403s.
+  const requireRole = async (req, reply, allowed) => {
+    if (req.operator?.breakglass || allowed.includes(req.operator.role)) return true;
+    await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.role_denied', actor_ref: req.operator.id,
+      resource_type: 'endpoint', resource_ref: req.url, outcome: 'denied', reason_code: 'ROLE_REQUIRED' });
+    reply.code(403).send({ error: 'OPERATOR_ROLE_REQUIRED', allowed });
+    return false;
+  };
+
+  // ---- group 9: TENANT-level offboarding lifecycle (MASTER_PLAN §13/§10/§15) — now operator-gated ----
   // Map the state-machine's RAISEs to HTTP. Gate failures are 409 (conflict with current state).
   const lifecycleError = (e) => {
     const m = String(e.message || '');
@@ -431,7 +463,8 @@ export function buildServer() {
   const relay = () => withServiceContext('svc_events', (c) => c.query('select app.relay_outbox(100)'));
 
   // Start an offboarding job for a tenant (phase 'requested').
-  app.post('/admin/offboarding/start', { preHandler: adminAuth }, async (req, reply) => {
+  app.post('/admin/offboarding/start', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['ops', 'admin'])) return;
     const { tenant, reason, retention_policy_key = 'offboarding-default' } = req.body || {};
     if (!tenant) return reply.code(400).send({ error: 'tenant (slug) is required' });
     try {
@@ -441,7 +474,7 @@ export function buildServer() {
         const j = await c.query(
           `insert into tenant_offboarding_jobs(tenant_id, retention_policy_id, reason, requested_by)
            values($1,(select id from retention_policies where policy_key=$2),$3,$4) returning id, phase`,
-          [t.id, retention_policy_key, reason || null, req.headers['x-operator-id'] || null]);
+          [t.id, retention_policy_key, reason || null, req.operator.id]);
         return { tenant_id: t.id, job: j.rows[0] };
       });
       if (!out) return reply.code(404).send({ error: 'tenant not found' });
@@ -453,12 +486,13 @@ export function buildServer() {
   });
 
   // Advance the state machine (enforces the §13 DAG + legal-hold/export/retention/completion gates).
-  app.post('/admin/offboarding/:id/advance', { preHandler: adminAuth }, async (req, reply) => {
+  app.post('/admin/offboarding/:id/advance', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['ops', 'admin'])) return;
     const { to } = req.body || {};
     if (!to) return reply.code(400).send({ error: 'target phase "to" is required' });
     try {
       const phase = await withServiceContext('svc_lifecycle', (c) =>
-        c.query('select app.advance_offboarding($1,$2,$3) p', [req.params.id, to, req.headers['x-operator-id'] || null]))
+        c.query('select app.advance_offboarding($1,$2,$3) p', [req.params.id, to, req.operator.id]))
         .then((r) => r.rows[0].p);
       await relay();
       return { offboarding_job_id: req.params.id, phase };
@@ -469,7 +503,8 @@ export function buildServer() {
   });
 
   // Persist an export verification receipt (the export completion gate, §10).
-  app.post('/admin/offboarding/:id/export-verify', { preHandler: adminAuth }, async (req, reply) => {
+  app.post('/admin/offboarding/:id/export-verify', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['ops', 'admin'])) return;
     const { manifest_hash = 'demo-manifest', signature_valid = true, checksum_valid = true } = req.body || {};
     const out = await withServiceContext('svc_lifecycle', async (c) => {
       const j = (await c.query('select tenant_id from tenant_offboarding_jobs where id=$1', [req.params.id])).rows[0];
@@ -487,10 +522,11 @@ export function buildServer() {
   });
 
   // Run the data-plane purge (only valid in purge_started) — writes cache + search receipts.
-  app.post('/admin/offboarding/:id/purge', { preHandler: adminAuth }, async (req, reply) => {
+  app.post('/admin/offboarding/:id/purge', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['ops', 'admin'])) return;
     try {
       const pj = await withServiceContext('svc_lifecycle', (c) =>
-        c.query('select app.execute_tenant_purge($1,$2) pj', [req.params.id, req.headers['x-operator-id'] || null]))
+        c.query('select app.execute_tenant_purge($1,$2) pj', [req.params.id, req.operator.id]))
         .then((r) => r.rows[0].pj);
       await relay();
       return { offboarding_job_id: req.params.id, purge_job_id: pj };
@@ -501,7 +537,8 @@ export function buildServer() {
   });
 
   // Inspect a job + its receipts and purge summary.
-  app.get('/admin/offboarding/:id', { preHandler: adminAuth }, async (req, reply) => {
+  app.get('/admin/offboarding/:id', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['ops', 'admin'])) return;
     const out = await withServiceContext('svc_lifecycle', async (c) => {
       const job = (await c.query('select * from tenant_offboarding_jobs where id=$1', [req.params.id])).rows[0];
       if (!job) return null;
@@ -519,7 +556,8 @@ export function buildServer() {
   });
 
   // Place a legal hold on a tenant (blocks purge progression, §13).
-  app.post('/admin/legal-hold', { preHandler: adminAuth }, async (req, reply) => {
+  app.post('/admin/legal-hold', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['ops', 'admin'])) return;
     const { tenant, reason, reference } = req.body || {};
     if (!tenant || !reason) return reply.code(400).send({ error: 'tenant (slug) and reason are required' });
     const out = await withServiceContext('svc_lifecycle', async (c) => {
@@ -527,7 +565,7 @@ export function buildServer() {
       if (!t) return null;
       const h = await c.query(
         'insert into legal_holds(tenant_id, reason, reference, placed_by) values($1,$2,$3,$4) returning id',
-        [t.id, reason, reference || null, req.headers['x-operator-id'] || null]);
+        [t.id, reason, reference || null, req.operator.id]);
       return h.rows[0].id;
     });
     if (!out) return reply.code(404).send({ error: 'tenant not found' });
@@ -535,10 +573,11 @@ export function buildServer() {
   });
 
   // Release a legal hold (unblocks purge progression).
-  app.post('/admin/legal-hold/:id/release', { preHandler: adminAuth }, async (req, reply) => {
+  app.post('/admin/legal-hold/:id/release', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['ops', 'admin'])) return;
     const n = await withServiceContext('svc_lifecycle', (c) =>
       c.query("update legal_holds set status='released', released_at=now(), released_by=$2 where id=$1 and status='active'",
-        [req.params.id, req.headers['x-operator-id'] || null]));
+        [req.params.id, req.operator.id]));
     return { legal_hold_id: req.params.id, released: n.rowCount };
   });
 
@@ -566,10 +605,75 @@ export function buildServer() {
     return { membershipId: m.rows[0].id, permissions: perms.rows.map((r) => r.permission_key) };
   });
 
-  // Open a support access request for a tenant (requester = a platform operator).
-  app.post('/admin/support/request', { preHandler: adminAuth }, async (req, reply) => {
-    const { tenant, requested_by, target_email, reason, ticket_ref, ttl_seconds = 1800, mode = 'read_only' } = req.body || {};
-    if (!tenant || !requested_by || !reason) return reply.code(400).send({ error: 'tenant, requested_by, reason are required' });
+  // ---- group 11: operator login/session + operator management ----
+
+  // Operator login: (email, api_key) -> an operator token bound to a fresh operator_session. The raw key
+  // is hashed server-side (no pass-the-hash). Both success and failure are audited to the platform chain.
+  app.post('/operator/login', async (req, reply) => {
+    const { email, api_key } = req.body || {};
+    if (!email || !api_key) return reply.code(400).send({ error: 'email and api_key are required' });
+    const key_prefix = String(api_key).slice(0, 12);
+    const authed = await withServiceContext('svc_ops', (c) =>
+      c.query('select * from app.operator_authenticate($1,$2,$3)', [email, key_prefix, api_key])).then((r) => r.rows[0]);
+    if (!authed) {
+      await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.login.denied',
+        actor_ref: String(email).slice(0, 80), outcome: 'denied', reason_code: 'BAD_CREDENTIAL' });
+      return reply.code(401).send({ error: 'invalid operator credentials' });
+    }
+    const osid = await withServiceContext('svc_ops', (c) =>
+      c.query('select app.start_operator_session($1,$2) id', [authed.operator_id, cfg.operatorTokenTtlSec])).then((r) => r.rows[0].id);
+    await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.login', actor_ref: authed.operator_id,
+      resource_type: 'operator_session', resource_ref: osid, outcome: 'success' });
+    const operator_token = mintOperatorToken({ operator_id: authed.operator_id, operator_role: authed.operator_role, osid });
+    return { operator_token, token_type: 'Bearer', operator_role: authed.operator_role, expires_in: cfg.operatorTokenTtlSec };
+  });
+
+  // Operator logout: revoke the caller's session — its token dies immediately (before TTL).
+  app.post('/operator/logout', { preHandler: operatorAuth }, async (req) => {
+    const n = await withServiceContext('svc_ops', (c) =>
+      c.query('select app.revoke_operator_session($1,$2) n', [req.operator.osid, 'logout'])).then((r) => Number(r.rows[0].n));
+    await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.logout', actor_ref: req.operator.id,
+      resource_type: 'operator_session', resource_ref: req.operator.osid, outcome: 'success' });
+    return { revoked: n };
+  });
+
+  // Create a platform operator (admin only).
+  app.post('/admin/operators', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['admin'])) return;
+    const { email, display_name, operator_role = 'support' } = req.body || {};
+    if (!email || !display_name) return reply.code(400).send({ error: 'email and display_name are required' });
+    try {
+      const id = await withServiceContext('svc_ops', (c) => c.query(
+        'insert into platform_operators(email, display_name, operator_role) values($1,$2,$3) returning id',
+        [email, display_name, operator_role])).then((r) => r.rows[0].id);
+      await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.created', actor_ref: req.operator.id,
+        resource_type: 'operator', resource_ref: id, meta: { operator_role } });
+      return { operator_id: id, operator_role };
+    } catch (e) { return reply.code(400).send({ error: /duplicate|unique/.test(e.message) ? 'operator already exists' : /check/.test(e.message) ? 'invalid operator_role' : 'create_failed' }); }
+  });
+
+  // Issue an API-key credential for an operator (admin only). Returns the raw key ONCE.
+  app.post('/admin/operators/:id/credential', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['admin'])) return;
+    const api_key = `opk_${randomUUID().replace(/-/g, '')}`;      // opaque high-entropy key
+    const key_prefix = api_key.slice(0, 12), secret_hash = sha256(api_key);
+    try {
+      const credId = await withServiceContext('svc_ops', (c) => c.query(
+        'insert into operator_credentials(operator_id, key_prefix, secret_hash, created_by) values($1,$2,$3,$4) returning id',
+        [req.params.id, key_prefix, secret_hash, req.operator.id])).then((r) => r.rows[0].id);
+      await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.credential.issued', actor_ref: req.operator.id,
+        resource_type: 'operator_credential', resource_ref: credId });
+      return { credential_id: credId, operator_id: req.params.id, api_key, note: 'store this key now — it is not retrievable' };
+    } catch (e) { return reply.code(400).send({ error: /foreign key/.test(e.message) ? 'operator not found' : 'issue_failed' }); }
+  });
+
+  // Open a support access request for a tenant. The requester IS the authenticated operator (from the
+  // token) — not a body field — so dual-control can't be gamed by naming someone else as requester.
+  app.post('/admin/support/request', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['support', 'ops', 'admin'])) return;
+    const { tenant, target_email, reason, ticket_ref, ttl_seconds = 1800, mode = 'read_only' } = req.body || {};
+    const requested_by = req.operator.id;
+    if (!tenant || !reason) return reply.code(400).send({ error: 'tenant and reason are required' });
     // MVP is read-only (spec §Notes): reject read_write so the returned mode never diverges from the
     // actually-enforced capability (the token is always tw=false). read_write is a future group.
     if (mode !== 'read_only') return reply.code(400).send({ error: 'MODE_UNSUPPORTED', detail: 'read_write impersonation is deferred; MVP is read-only' });
@@ -595,32 +699,34 @@ export function buildServer() {
     return { support_access_request_id: id, tenant_id: resolved.tenantId, status: 'pending' };
   });
 
-  // Approve a request — dual-control: approver MUST differ from requester (else 409 + audited denial).
-  app.post('/admin/support/request/:id/approve', { preHandler: adminAuth }, async (req, reply) => {
-    const { approver } = req.body || {};
-    if (!approver) return reply.code(400).send({ error: 'approver is required' });
-    const tenantId = await withServiceContext('svc_support', (c) =>
+  // Approve a request — TRUE dual-control: the approver is derived from the AUTHENTICATED operator's live
+  // session inside app.approve_support_request, and must differ from the requester (else 409 + audited).
+  app.post('/admin/support/request/:id/approve', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['support', 'ops', 'admin'])) return;
+    // svc_ops spans support_access_requests + operator_sessions + platform_operators (the approve fn reads all).
+    const tenantId = await withServiceContext('svc_ops', (c) =>
       c.query('select tenant_id from support_access_requests where id=$1', [req.params.id])).then((r) => r.rows[0]?.tenant_id);
     if (!tenantId) return reply.code(404).send({ error: 'SUPPORT_REQUEST_NOT_FOUND' });
     try {
-      await withServiceContext('svc_support', (c) => c.query('select app.approve_support_request($1,$2)', [req.params.id, approver]));
+      await withServiceContext('svc_ops', (c) => c.query('select app.approve_support_request($1,$2)', [req.params.id, req.operator.osid]));
       await auditAppend('svc_support', { chain_id: tenantId, tenant: tenantId, action: 'support.request.approved',
-        actor_ref: approver, resource_type: 'support_access_request', resource_ref: req.params.id });
+        actor_ref: req.operator.id, resource_type: 'support_access_request', resource_ref: req.params.id });
       return { support_access_request_id: req.params.id, status: 'approved' };
     } catch (e) {
       const m = String(e.message);
       const reason = /SELF_APPROVAL/.test(m) ? 'SELF_APPROVAL_DENIED' : /NOT_PENDING/.test(m) ? 'NOT_PENDING'
-        : /APPROVER_INVALID/.test(m) ? 'APPROVER_INVALID' : 'APPROVE_FAILED';
+        : /APPROVER_SESSION_INVALID/.test(m) ? 'APPROVER_SESSION_INVALID' : 'APPROVE_FAILED';
       await auditAppend('svc_support', { chain_id: tenantId, tenant: tenantId, action: 'support.request.approve',
-        actor_ref: approver, resource_type: 'support_access_request', resource_ref: req.params.id, outcome: 'denied', reason_code: reason });
-      if (/SELF_APPROVAL|NOT_PENDING|APPROVER_INVALID/.test(m)) return reply.code(409).send({ error: reason });
+        actor_ref: req.operator.id, resource_type: 'support_access_request', resource_ref: req.params.id, outcome: 'denied', reason_code: reason });
+      if (/SELF_APPROVAL|NOT_PENDING|APPROVER_SESSION_INVALID/.test(m)) return reply.code(409).send({ error: reason });
       throw e;
     }
   });
 
   // Deny a request (audited).
-  app.post('/admin/support/request/:id/deny', { preHandler: adminAuth }, async (req, reply) => {
-    const { approver, reason } = req.body || {};
+  app.post('/admin/support/request/:id/deny', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['support', 'ops', 'admin'])) return;
+    const { reason } = req.body || {};
     const out = await withServiceContext('svc_support', async (c) => {
       const r = (await c.query('select tenant_id from support_access_requests where id=$1', [req.params.id])).rows[0];
       if (!r) return null;
@@ -629,12 +735,13 @@ export function buildServer() {
     });
     if (!out) return reply.code(404).send({ error: 'SUPPORT_REQUEST_NOT_FOUND' });
     await auditAppend('svc_support', { chain_id: out, tenant: out, action: 'support.request.denied',
-      actor_ref: approver || null, resource_type: 'support_access_request', resource_ref: req.params.id, outcome: 'denied', reason_code: 'operator_denied' });
+      actor_ref: req.operator.id, resource_type: 'support_access_request', resource_ref: req.params.id, outcome: 'denied', reason_code: 'operator_denied' });
     return { support_access_request_id: req.params.id, status: 'denied' };
   });
 
   // Start impersonation from an approved request → returns a READ-ONLY support token + banner signal.
-  app.post('/admin/support/impersonate', { preHandler: adminAuth }, async (req, reply) => {
+  app.post('/admin/support/impersonate', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['support', 'ops', 'admin'])) return;
     const { request_id } = req.body || {};
     if (!request_id) return reply.code(400).send({ error: 'request_id is required' });
     const rq = await withServiceContext('svc_support', (c) =>
@@ -722,7 +829,8 @@ export function buildServer() {
 
   // End an impersonation session (revokes the underlying group-5 session tree). Runs as svc_ops so the
   // internal revoke_session_cascade can touch the svc_session-owned `sessions` table.
-  app.post('/admin/support/session/:id/end', { preHandler: adminAuth }, async (req, reply) => {
+  app.post('/admin/support/session/:id/end', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['support', 'ops', 'admin'])) return;
     const out = await withServiceContext('svc_ops', async (c) => {
       const s = (await c.query('select tenant_id from support_sessions where id=$1', [req.params.id])).rows[0];
       if (!s) return null;
@@ -736,7 +844,8 @@ export function buildServer() {
   });
 
   // Verify a chain's integrity (operator/audit read).
-  app.get('/admin/audit/verify', { preHandler: adminAuth }, async (req, reply) => {
+  app.get('/admin/audit/verify', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['support', 'ops', 'admin'])) return;
     const chain = req.query.chain;
     if (!chain) return reply.code(400).send({ error: 'chain query param required (tenant slug or "platform")' });
     const chainId = chain === 'platform' ? 'platform'
@@ -747,7 +856,8 @@ export function buildServer() {
   });
 
   // Tail a chain (operator/audit read).
-  app.get('/admin/audit/tail', { preHandler: adminAuth }, async (req, reply) => {
+  app.get('/admin/audit/tail', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['support', 'ops', 'admin'])) return;
     const chain = req.query.chain;
     if (!chain) return reply.code(400).send({ error: 'chain query param required' });
     const chainId = chain === 'platform' ? 'platform'
@@ -760,7 +870,8 @@ export function buildServer() {
 
   // Anchor a chain's current head (§16 Tier-A periodic external anchoring). Records the head hash in an
   // insert-once anchor point (idempotent); the external WORM/notary sink is a Tier-B deferral.
-  app.post('/admin/audit/anchor', { preHandler: adminAuth }, async (req, reply) => {
+  app.post('/admin/audit/anchor', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['ops', 'admin'])) return;
     const chain = (req.body && req.body.chain) || req.query.chain;
     if (!chain) return reply.code(400).send({ error: 'chain required (tenant slug or "platform")' });
     const chainId = chain === 'platform' ? 'platform'

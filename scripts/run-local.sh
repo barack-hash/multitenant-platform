@@ -25,7 +25,8 @@ echo "== start (port $PORT) =="
 
 echo "== reset =="
 "$PGBIN/psql" "$DATABASE_URL" -q -c "drop schema if exists app cascade;
-  drop table if exists audit_anchor_points, audit_events, support_sessions, support_access_requests,
+  drop table if exists operator_sessions, operator_credentials,
+    audit_anchor_points, audit_events, support_sessions, support_access_requests,
     platform_operators, tenant_rate_limit_overrides, rate_limit_policies, platform_deployments,
     schema_migration_runs, environment_promotions,
     tenant_deletion_tombstones, search_purge_receipts, cache_purge_receipts,
@@ -77,6 +78,9 @@ node test/offboarding.test.mjs || RC=1
 echo ""
 echo "== DB isolation gate (group 10 · support/impersonation + audit) =="
 node test/support.test.mjs || RC=1
+echo ""
+echo "== DB isolation gate (group 11 · per-operator platform-ops auth) =="
+node test/operator.test.mjs || RC=1
 echo ""
 echo "== API gate =="
 node test/api.test.mjs || RC=1

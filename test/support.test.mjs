@@ -50,7 +50,9 @@ async function makeActiveSession(c, { requester = OP1, approver = OP2, tenant = 
   const req = (await c.query(
     `insert into support_access_requests(tenant_id, requested_by, target_user_id, reason, ttl_seconds)
      values($1,$2,$3,'t',$4) returning id`, [tenant, requester, target, ttl])).rows[0].id;
-  await c.query('select app.approve_support_request($1,$2)', [req, approver]);
+  // The approver is derived from a LIVE operator session (group-11 dual-control binding).
+  const approverSess = (await c.query('select app.start_operator_session($1) id', [approver])).rows[0].id;
+  await c.query('select app.approve_support_request($1,$2)', [req, approverSess]);
   return { req, ss: (await c.query('select app.start_support_session($1,null) id', [req])).rows[0].id };
 }
 
@@ -106,13 +108,19 @@ test('4  audit_events is append-only — update/delete/truncate all raise (even 
   } finally { await c.query('rollback').catch(() => {}); }
 });
 
-test('5  dual-control: an operator cannot approve their own request; a different approver can', async (c) =>
-  withCtx(c, svc('svc_support'), async () => {
+test('5  dual-control: the approver is a LIVE operator session distinct from the requester', async (c) =>
+  withCtx(c, svc('svc_ops'), async () => {
     const req = (await c.query(
       `insert into support_access_requests(tenant_id, requested_by, target_user_id, reason) values($1,$2,$3,'t') returning id`, [T1, OP1, U1])).rows[0].id;
-    await expectErr(c, () => c.query('select app.approve_support_request($1,$2)', [req, OP1]), /SUPPORT_SELF_APPROVAL_DENIED/, 'self-approval blocked');
-    eq((await c.query('select app.approve_support_request($1,$2) r', [req, OP2])).rows[0].r, 'approved', 'other approver ok');
-    // The dual-control CHECK also blocks it at the row level, independent of the function.
+    const sessOP1 = (await c.query('select app.start_operator_session($1) id', [OP1])).rows[0].id;
+    const sessOP2 = (await c.query('select app.start_operator_session($1) id', [OP2])).rows[0].id;
+    // Approving via the REQUESTER's own session is self-approval → denied.
+    await expectErr(c, () => c.query('select app.approve_support_request($1,$2)', [req, sessOP1]), /SUPPORT_SELF_APPROVAL_DENIED/, 'self-approval via own session blocked');
+    // A bogus/non-live session cannot approve (approver must be a live authenticated operator).
+    await expectErr(c, () => c.query('select app.approve_support_request($1,$2)', [req, '00000000-0000-0000-0000-0000000000aa']), /SUPPORT_APPROVER_SESSION_INVALID/, 'non-live session rejected');
+    // A DISTINCT operator's live session approves.
+    eq((await c.query('select app.approve_support_request($1,$2) r', [req, sessOP2])).rows[0].r, 'approved', 'distinct operator session approves');
+    // The row-level CHECK still blocks requester==approver independently.
     await expectErr(c, () => c.query(
       `insert into support_access_requests(tenant_id, requested_by, approved_by, reason) values($1,$2,$2,'t')`, [T1, OP1]),
       /ck_support_dual_control/, 'row CHECK blocks requester==approver');
@@ -128,7 +136,7 @@ test('6  a support session TTL cannot exceed 30 minutes (CHECK)', async (c) =>
   }));
 
 test('7  a support session is non-renewable: expires_at cannot be extended, terminal cannot reactivate', async (c) =>
-  withCtx(c, svc('svc_support'), async () => {
+  withCtx(c, svc('svc_ops'), async () => {
     const { ss } = await makeActiveSession(c);
     await expectErr(c, () => c.query("update support_sessions set expires_at = expires_at + interval '10 minutes' where id=$1", [ss]),
       /SUPPORT_SESSION_NOT_RENEWABLE/, 'extension blocked');
@@ -138,13 +146,13 @@ test('7  a support session is non-renewable: expires_at cannot be extended, term
   }));
 
 test('8  only one ACTIVE support session per (operator, tenant)', async (c) =>
-  withCtx(c, svc('svc_support'), async () => {
+  withCtx(c, svc('svc_ops'), async () => {
     await makeActiveSession(c);
     await expectErr(c, () => makeActiveSession(c), /duplicate key|ux_support_sessions_one_active/, 'second active blocked');
   }));
 
 test('9  prohibited action classes hard-deny; expired session denies too', async (c) =>
-  withCtx(c, svc('svc_support'), async () => {
+  withCtx(c, svc('svc_ops'), async () => {
     for (const k of ['billing', 'identity_secret', 'lifecycle_destructive', 'role_privilege', 'infra_secret'])
       eq((await c.query('select app.support_action_prohibited($1) p', [k])).rows[0].p, true, `${k} prohibited`);
     eq((await c.query("select app.support_action_prohibited('view_dashboard') p")).rows[0].p, false, 'benign allowed');
