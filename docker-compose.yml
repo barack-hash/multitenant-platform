@@ -1,0 +1,20 @@
+# Disposable local Postgres for foundation isolation tests.
+# Isolated: unique project name, non-standard host port 55432, ephemeral (own named volume only).
+name: mtp-foundation-test
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "55432:5432"
+    volumes:
+      - mtp_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+volumes:
+  mtp_pgdata:

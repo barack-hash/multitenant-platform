@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Hub Console — MultiTenant Platform</title>
+<style>
+  :root{
+    --bg:#0b0f17; --panel:#121826; --panel2:#0f1420; --line:#222c40; --text:#e6ebf5;
+    --muted:#8fa0bd; --accent:#5b8cff; --good:#3ecf8e; --bad:#ff6b6b; --chip:#1b2335;
+  }
+  @media (prefers-color-scheme: light){
+    :root{ --bg:#f5f7fb; --panel:#ffffff; --panel2:#f0f3f9; --line:#dfe5ef; --text:#111827;
+           --muted:#5b6b85; --accent:#3b6cf6; --good:#1a9d63; --bad:#d64545; --chip:#eef2fa; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--text)}
+  .wrap{max-width:900px;margin:0 auto;padding:28px 20px 60px}
+  h1{font-size:20px;margin:0 0 2px} .sub{color:var(--muted);margin:0 0 22px;font-size:13px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media (max-width:680px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px}
+  .card h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 12px}
+  label{display:block;font-size:12px;color:var(--muted);margin:10px 0 4px}
+  input,select{width:100%;padding:9px 11px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;color:var(--text);font-size:14px}
+  button{cursor:pointer;border:0;border-radius:8px;padding:9px 14px;font-size:14px;font-weight:600;background:var(--accent);color:#fff;margin-top:14px}
+  button.ghost{background:var(--chip);color:var(--text);border:1px solid var(--line);font-weight:500;margin:6px 6px 0 0;padding:7px 11px;font-size:13px}
+  .presets{margin:2px 0 4px}
+  .status{font-size:13px;margin-top:12px;min-height:18px}
+  .ok{color:var(--good)} .err{color:var(--bad)}
+  pre{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:12px;overflow:auto;font-size:12.5px;margin:0}
+  .kv{display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px dashed var(--line);font-size:13px}
+  .kv:last-child{border-bottom:0} .kv b{color:var(--muted);font-weight:500}
+  .chip{display:inline-block;background:var(--chip);border:1px solid var(--line);border-radius:20px;padding:2px 10px;font-size:12px;margin:3px 4px 0 0}
+  .tenant{font-weight:700;color:var(--accent)}
+  .foot{color:var(--muted);font-size:12px;margin-top:22px;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Hub Console</h1>
+  <p class="sub">Same UI, different identity — the tenant you see is enforced by Postgres RLS, not the frontend.</p>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Sign in</h2>
+      <div class="presets">
+        <button class="ghost" onclick="preset('u1@example.com','tenant-one')">U1 · member · tenant-one</button>
+        <button class="ghost" onclick="preset('u3@example.com','tenant-one')">U3 · admin · tenant-one</button>
+        <button class="ghost" onclick="preset('u2@example.com','tenant-two')">U2 · member · tenant-two</button>
+        <button class="ghost" onclick="preset('u1@example.com','tenant-two')">U1 → tenant-two (denied)</button>
+      </div>
+      <label>Email</label><input id="email" value="u1@example.com" />
+      <label>Tenant slug</label><input id="tenant" value="tenant-one" />
+      <button onclick="login()">Log in</button>
+      <div id="loginStatus" class="status"></div>
+    </div>
+
+    <div class="card">
+      <h2>Hub token claims</h2>
+      <div id="claims"><span class="sub">Not signed in.</span></div>
+    </div>
+  </div>
+
+  <div class="grid" style="margin-top:16px">
+    <div class="card">
+      <h2>/me</h2>
+      <div id="me"><span class="sub">—</span></div>
+    </div>
+    <div class="card">
+      <h2>/memberships</h2>
+      <div id="memberships"><span class="sub">—</span></div>
+    </div>
+  </div>
+
+  <div class="grid" style="margin-top:16px">
+    <div class="card">
+      <h2>/my-apps · activated apps (group 2)</h2>
+      <div id="apps"><span class="sub">—</span></div>
+    </div>
+    <div class="card">
+      <h2>/my-entitlements (group 3)</h2>
+      <div id="entitlements"><span class="sub">—</span></div>
+      <button class="ghost" id="recomputeBtn" onclick="recompute()" style="display:none;margin-top:12px">Recompute entitlements (admin)</button>
+      <div id="recomputeStatus" class="status"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h2>/my-events · event stream (group 4)</h2>
+    <div id="events"><span class="sub">—</span></div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h2>Launch flow (group 5) · login → launch → exchange → spoke → revoke</h2>
+    <button class="ghost" id="launchBtn" onclick="launchApp('hifz-lms')" style="display:none">Launch hifz-lms → open spoke session</button>
+    <button class="ghost" id="revokeBtn" onclick="revokeAll()" style="display:none">Revoke all sessions (sign out everywhere)</button>
+    <div id="launchStatus" class="status"></div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h2>Billing webhooks (group 6) · simulate Stripe → lock/unlock the app (affects tenant-one)</h2>
+    <button class="ghost" id="pastdueBtn" onclick="simulateWebhook('past_due')" style="display:none">Simulate subscription past_due</button>
+    <button class="ghost" id="activeBtn" onclick="simulateWebhook('active')" style="display:none">Simulate subscription active</button>
+    <div id="webhookStatus" class="status"></div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h2>Minor-data protection (group 7–8) · OQ-034 consent gate + subject erasure</h2>
+    <button class="ghost" id="readStudentBtn" onclick="readStudent()" style="display:none">Read student</button>
+    <button class="ghost" id="grantConsentBtn" onclick="setConsent(true)" style="display:none">Grant parental consent</button>
+    <button class="ghost" id="revokeConsentBtn" onclick="setConsent(false)" style="display:none">Revoke consent</button>
+    <button class="ghost" id="eraseStudentBtn" onclick="eraseStudent()" style="display:none">Erase student (right to be forgotten)</button>
+    <div id="minorStatus" class="status"></div>
+  </div>
+
+  <p class="foot">Hub API · svc_app least-privilege · RLS-enforced · foundation table-groups 1–8</p>
+</div>
+
+<script>
+let token = null;
+const $ = (id) => document.getElementById(id);
+function preset(e,t){ $('email').value=e; $('tenant').value=t; login(); }
+
+async function login(){
+  const email=$('email').value, tenant=$('tenant').value;
+  $('loginStatus').textContent='…'; $('loginStatus').className='status';
+  try{
+    const r = await fetch('/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email,tenant})});
+    const j = await r.json();
+    if(!r.ok){ token=null; $('loginStatus').className='status err'; $('loginStatus').textContent='✗ '+(j.error||r.status); render(null); return; }
+    token=j.token;
+    $('loginStatus').className='status ok'; $('loginStatus').textContent='✓ signed in as '+email+' @ '+tenant;
+    render(decode(token)); await load();
+  }catch(e){ $('loginStatus').className='status err'; $('loginStatus').textContent='✗ '+e.message; }
+}
+function decode(t){ try{ return JSON.parse(atob(t.split('.')[1])); }catch{ return {}; } }
+function render(c){
+  if(!c){ $('claims').innerHTML='<span class="sub">Not signed in.</span>'; $('me').innerHTML='<span class="sub">—</span>'; $('memberships').innerHTML='<span class="sub">—</span>'; $('apps').innerHTML='<span class="sub">—</span>'; $('entitlements').innerHTML='<span class="sub">—</span>'; $('events').innerHTML='<span class="sub">—</span>'; $('recomputeBtn').style.display='none'; $('recomputeStatus').textContent=''; $('launchBtn').style.display='none'; $('revokeBtn').style.display='none'; $('launchStatus').textContent=''; $('pastdueBtn').style.display='none'; $('activeBtn').style.display='none'; $('webhookStatus').textContent=''; ['readStudentBtn','grantConsentBtn','revokeConsentBtn','eraseStudentBtn'].forEach(id=>$(id).style.display='none'); $('minorStatus').textContent=''; return; }
+  $('recomputeBtn').style.display = (c.permissions||[]).includes('billing.manage') ? 'inline-block' : 'none';
+  $('launchBtn').style.display='inline-block'; $('revokeBtn').style.display='none'; $('launchStatus').textContent='';
+  $('pastdueBtn').style.display='inline-block'; $('activeBtn').style.display='inline-block'; $('webhookStatus').textContent='';
+  const canS = (c.permissions||[]).includes('students.read') ? 'inline-block' : 'none';
+  ['readStudentBtn','grantConsentBtn','revokeConsentBtn','eraseStudentBtn'].forEach(id=>$(id).style.display=canS); $('minorStatus').textContent='';
+  $('claims').innerHTML =
+    row('tenant (tid)', '<span class="tenant">'+short(c.tid)+'</span>') +
+    row('user (sub)', short(c.sub)) +
+    row('membership (mid)', short(c.mid)) +
+    row('roles', (c.roles||[]).map(chip).join('')||'<span class="sub">none</span>') +
+    row('permissions', (c.permissions||[]).map(chip).join('')||'<span class="sub">none</span>') +
+    row('writes allowed', c.tw?'<span class="ok">yes</span>':'<span class="err">no</span>');
+}
+async function load(){
+  const h={authorization:'Bearer '+token};
+  const me = await (await fetch('/me',{headers:h})).json();
+  $('me').innerHTML = me.me ? row('user_id',short(me.me.user_id))+row('email',me.me.primary_email)+row('name',me.me.display_name)+row('status',me.me.status) : '<span class="sub">no row</span>';
+  const mem = await (await fetch('/memberships',{headers:h})).json();
+  $('memberships').innerHTML = (mem.memberships||[]).length
+    ? mem.memberships.map(m=>row('membership',short(m.membership_id))+row('tenant','<span class="tenant">'+short(m.tenant_id)+'</span>')+row('status',m.status)).join('<hr style="border:0;border-top:1px dashed var(--line);margin:8px 0">')
+    : '<span class="sub">none</span>';
+  const ap = await (await fetch('/my-apps',{headers:h})).json();
+  $('apps').innerHTML = (ap.apps||[]).length ? (ap.apps||[]).map(appRow).join('') : '<span class="sub">none</span>';
+  const en = await (await fetch('/my-entitlements',{headers:h})).json();
+  const e = en.entitlements;
+  $('entitlements').innerHTML = e
+    ? row('plan','<span class="chip">'+(e.entitlements.plan_key||'—')+'</span>')
+      + row('billing','<span class="'+(e.billing_status==='active'?'ok':'err')+'">'+e.billing_status+'</span>')
+      + row('ent_v','<b>'+e.snapshot_version+'</b>')
+      + row('entitled apps',(e.entitlements.app_keys||[]).map(chip).join('')||'<span class="sub">none</span>')
+      + row('limits','<span class="sub">'+JSON.stringify(e.limits)+'</span>')
+    : '<span class="sub">none</span>';
+  const ev = await (await fetch('/my-events',{headers:h})).json();
+  $('events').innerHTML = (ev.events||[]).length ? (ev.events||[]).map(evRow).join('') : '<span class="sub">none</span>';
+}
+function evRow(e){
+  const t = new Date(e.occurred_at).toLocaleTimeString();
+  return '<div class="kv"><b><span class="chip">'+e.event_type+'</span></b><span class="sub">'+t+'</span></div>';
+}
+function appRow(a){
+  const badge = a.launchable
+    ? '<span class="chip" style="border-color:var(--good);color:var(--good)">launchable</span>'
+    : '<span class="chip" style="border-color:var(--bad);color:var(--bad)">'+a.status+(a.lock_reason?' · '+a.lock_reason:'')+'</span>';
+  return '<div class="kv"><b>'+a.name+' <span class="sub">('+a.app_key+')</span></b><span>'+badge+'</span></div>';
+}
+const S1 = 'f1000000-0000-0000-0000-000000000001';
+async function readStudent(){
+  const r = await fetch('/students/'+S1,{headers:{authorization:'Bearer '+token}});
+  const j = await r.json();
+  if(r.status===200){ $('minorStatus').className='status ok'; $('minorStatus').textContent='✓ student: '+j.student.full_name+' · minor='+j.student.is_minor+' · status='+j.student.status; }
+  else { $('minorStatus').className='status err'; $('minorStatus').textContent='✗ '+r.status+' '+(j.error||''); }
+}
+async function setConsent(granted){
+  await fetch('/students/'+S1+'/consent',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer '+token},body:JSON.stringify({granted})});
+  $('minorStatus').className='status'; $('minorStatus').textContent=(granted?'✓ parental consent granted':'✓ consent revoked')+' — now click “Read student”';
+}
+async function eraseStudent(){
+  const r = await (await fetch('/students/'+S1+'/erase',{method:'POST',headers:{authorization:'Bearer '+token}})).json();
+  $('minorStatus').className='status ok'; $('minorStatus').textContent='✓ erased '+r.erased+' record(s) — subject forgotten (PII shredded, files purged), tenant intact';
+}
+async function simulateWebhook(status){
+  $('webhookStatus').className='status'; $('webhookStatus').textContent='sending Stripe '+status+' webhook…';
+  const r = await (await fetch('/dev/simulate-stripe',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({status})})).json();
+  const code = r.result && r.result.code;
+  $('webhookStatus').className='status ok';
+  $('webhookStatus').textContent='✓ Stripe '+status+' webhook → '+code+' processed · check /my-apps below';
+  await load();
+}
+let spokeToken = null;
+async function launchApp(appKey){
+  $('launchStatus').className='status'; $('launchStatus').textContent='launching '+appKey+'…';
+  const l = await (await fetch('/launch',{method:'POST',headers:{'content-type':'application/json',authorization:'Bearer '+token},body:JSON.stringify({app_key:appKey})})).json();
+  if(l.error){ $('launchStatus').className='status err'; $('launchStatus').textContent='✗ launch: '+l.error; return; }
+  const x = await (await fetch('/token/exchange',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({launch_token:l.launch_token, nonce:l.nonce})})).json();
+  if(x.error){ $('launchStatus').className='status err'; $('launchStatus').textContent='✗ exchange: '+x.error; return; }
+  spokeToken = x.spoke_session_token;
+  const ctx = await (await fetch('/spoke/context',{headers:{authorization:'Bearer '+spokeToken}})).json();
+  $('launchStatus').className='status ok'; $('launchStatus').textContent='✓ spoke session active for '+appKey+' (session '+String(ctx.session||'').slice(0,8)+'…)';
+  $('revokeBtn').style.display='inline-block';
+}
+async function revokeAll(){
+  await fetch('/sessions/revoke',{method:'POST',headers:{authorization:'Bearer '+token}});
+  const r = await fetch('/spoke/context',{headers:{authorization:'Bearer '+spokeToken}});
+  if(r.status===401){ $('launchStatus').className='status err'; $('launchStatus').textContent='✓ root revoked → spoke session now 401 SESSION_REVOKED (cascade)'; }
+  else { $('launchStatus').className='status'; $('launchStatus').textContent='(spoke still active — unexpected)'; }
+  $('revokeBtn').style.display='none';
+}
+async function recompute(){
+  $('recomputeStatus').className='status'; $('recomputeStatus').textContent='…';
+  const r = await fetch('/billing/recompute',{method:'POST',headers:{authorization:'Bearer '+token}});
+  const j = await r.json();
+  if(!r.ok){ $('recomputeStatus').className='status err'; $('recomputeStatus').textContent='✗ '+(j.error||r.status); return; }
+  $('recomputeStatus').className='status ok';
+  $('recomputeStatus').textContent='✓ ent_v → '+j.ent_v+' · your token is now stale (guarded writes 409 until re-login)';
+  await load();
+}
+const row=(k,v)=>'<div class="kv"><b>'+k+'</b><span>'+v+'</span></div>';
+const chip=(x)=>'<span class="chip">'+x+'</span>';
+const short=(u)=> u? String(u).slice(0,8)+'…' : '—';
+</script>
+</body>
+</html>
