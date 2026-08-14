@@ -52,15 +52,25 @@ export function verifyHubToken(token) {
 
 // Operator token (group 11): authenticates a PLATFORM OPERATOR (not a tenant user) for /admin/*.
 // aud='operator'; bound to a live operator_session (osid) so revocation kills it before expiry.
-export function mintOperatorToken({ operator_id, operator_role, osid, ttlSec = cfg.operatorTokenTtlSec }) {
+// amr/acr (group 12) carry the auth methods + assurance level ('mfa' unlocks step-up endpoints).
+export function mintOperatorToken({ operator_id, operator_role, osid, amr = ['pwd'], acr = 'pwd', ttlSec = cfg.operatorTokenTtlSec }) {
   return jwt.sign(
-    { ver: 1, jti: randomUUID(), actor_type: 'operator', orole: operator_role, osid },
+    { ver: 1, jti: randomUUID(), actor_type: 'operator', orole: operator_role, osid, amr, acr },
     cfg.jwtSecret,
     { algorithm: 'HS256', subject: operator_id, issuer: cfg.iss, audience: 'operator', expiresIn: ttlSec }
   );
 }
 export const verifyOperatorToken = (t) =>
   jwt.verify(t, cfg.jwtSecret, { algorithms: ['HS256'], issuer: cfg.iss, audience: 'operator' });
+
+// Pending-MFA token (group 12): issued by /operator/login when the operator has active MFA. It is NOT a
+// session token (distinct aud) — it can ONLY be exchanged at /operator/mfa/verify for a real session.
+export function mintOperatorMfaToken({ operator_id }) {
+  return jwt.sign({ ver: 1, jti: randomUUID(), mfa_pending: true }, cfg.jwtSecret,
+    { algorithm: 'HS256', subject: operator_id, issuer: cfg.iss, audience: 'operator-mfa', expiresIn: cfg.operatorMfaTtlSec });
+}
+export const verifyOperatorMfaToken = (t) =>
+  jwt.verify(t, cfg.jwtSecret, { algorithms: ['HS256'], issuer: cfg.iss, audience: 'operator-mfa' });
 
 // Map verified token claims to the DB context GUCs the RLS helpers read.
 export function gucsFromClaims(c) {

@@ -10,7 +10,7 @@
     "migrate": "for f in db/migrations/*.sql; do echo \"-- $f\"; psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f \"$f\"; done",
     "seed": "for f in db/seed/*.sql; do psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f \"$f\"; done",
     "start": "node src/server.js",
-    "test:db": "node test/isolation.mjs && node test/apps.test.mjs && node test/entitlements.test.mjs && node test/events.test.mjs && node test/sessions.test.mjs && node test/webhooks.test.mjs && node test/files.test.mjs && node test/minors.test.mjs && node test/offboarding.test.mjs && node test/support.test.mjs && node test/operator.test.mjs",
+    "test:db": "node test/isolation.mjs && node test/apps.test.mjs && node test/entitlements.test.mjs && node test/events.test.mjs && node test/sessions.test.mjs && node test/webhooks.test.mjs && node test/files.test.mjs && node test/minors.test.mjs && node test/offboarding.test.mjs && node test/support.test.mjs && node test/operator.test.mjs && node test/mfa.test.mjs",
     "test:api": "node test/api.test.mjs",
     "test": "npm run test:db && node test/api.test.mjs"
   },

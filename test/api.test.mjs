@@ -3,6 +3,7 @@
 import { buildServer } from '../src/server.js';
 import { closePools } from '../src/db.js';
 import { createHmac } from 'node:crypto';
+import { totp } from '../src/mfa.js';
 
 function signedEvent(body) {
   const raw = JSON.stringify(body);
@@ -240,11 +241,17 @@ test('minor: subject-level erasure removes the student + their files (tenant int
   eq(r.statusCode, 404, '...but the erased student is gone');
 });
 
-// ---- group 11 setup: log in DISTINCT operators (real per-operator auth replaces the shared token) ----
+// ---- group 11/12 setup: log in DISTINCT operators; ops/admin step up through MFA (group 12) ----
 const loginOp = (email, api_key) => app.inject({ method: 'POST', url: '/operator/login', payload: { email, api_key } }).then((r) => r.json().operator_token);
-const opsTok = await loginOp('ops1@platform.example', 'opk_op3_key_cccccccc');       // ops role
-const supTokA = await loginOp('support1@platform.example', 'opk_op1_key_aaaaaaaa');   // support (requester)
-const supTokB = await loginOp('support2@platform.example', 'opk_op2_key_bbbbbbbb');   // support (approver)
+async function loginOpMfa(email, api_key, secret) {
+  const r1 = (await app.inject({ method: 'POST', url: '/operator/login', payload: { email, api_key } })).json();
+  if (!r1.mfa_required) return r1.operator_token;
+  return (await app.inject({ method: 'POST', url: '/operator/mfa/verify', payload: { mfa_token: r1.mfa_token, code: totp(secret) } })).json().operator_token;
+}
+const opsTok = await loginOpMfa('ops1@platform.example', 'opk_op3_key_cccccccc', 'JBSWY3DPEHPK3PXP');    // ops + MFA
+const adminTok = await loginOpMfa('admin1@platform.example', 'opk_op4_key_dddddddd', 'KRSXG5CTMVRXEZLU'); // admin + MFA
+const supTokA = await loginOp('support1@platform.example', 'opk_op1_key_aaaaaaaa');   // support (password-only)
+const supTokB = await loginOp('support2@platform.example', 'opk_op2_key_bbbbbbbb');   // support (password-only)
 
 // ---- group 9: TENANT-level offboarding lifecycle (operator-gated, ops role; dedicated tenant-three) ----
 const adminHdr = bearer(opsTok);
@@ -406,8 +413,9 @@ test('support: an operator can anchor a chain head (§16 Tier-A periodic anchori
 
 // ---- group 11: per-operator platform-ops auth ----
 test('operator: bad key is 401 (audited); good key issues an operator token with its role', async () => {
-  eq((await app.inject({ method: 'POST', url: '/operator/login', payload: { email: 'ops1@platform.example', api_key: 'opk_op3_key_WRONGXX' } })).statusCode, 401, 'bad key rejected');
-  const good = await app.inject({ method: 'POST', url: '/operator/login', payload: { email: 'ops1@platform.example', api_key: 'opk_op3_key_cccccccc' } });
+  // ops2 (op5) has no MFA, so its login returns a full token directly (op3/op4 now step up via MFA).
+  eq((await app.inject({ method: 'POST', url: '/operator/login', payload: { email: 'ops2@platform.example', api_key: 'opk_op5_key_WRONGXX' } })).statusCode, 401, 'bad key rejected');
+  const good = await app.inject({ method: 'POST', url: '/operator/login', payload: { email: 'ops2@platform.example', api_key: 'opk_op5_key_eeeeeeee' } });
   eq(good.statusCode, 200, 'good key'); eq(good.json().operator_role, 'ops', 'role carried'); if (!good.json().operator_token) throw new Error('no operator token');
 });
 
@@ -424,6 +432,59 @@ test('operator: logout revokes the session → the token is immediately rejected
   const tok = await loginOp('support2@platform.example', 'opk_op2_key_bbbbbbbb');
   eq((await app.inject({ method: 'POST', url: '/operator/logout', headers: bearer(tok) })).json().revoked, 1, 'logout revokes the session');
   eq((await app.inject({ method: 'GET', url: '/admin/audit/tail?chain=platform', headers: bearer(tok) })).statusCode, 401, 'revoked token no longer authenticates');
+});
+
+// ---- group 12: operator MFA + SSO ----
+test('mfa: step-up — an ops operator WITHOUT MFA is denied destructive lifecycle (403 MFA_REQUIRED)', async () => {
+  const pwdOps = await loginOp('ops2@platform.example', 'opk_op5_key_eeeeeeee');   // ops, no MFA → acr='pwd'
+  const r = await app.inject({ method: 'POST', url: '/admin/offboarding/start', headers: bearer(pwdOps), payload: { tenant: 'tenant-one' } });
+  eq(r.statusCode, 403, 'pwd-only ops denied step-up'); eq(r.json().error, 'MFA_REQUIRED', 'code');
+});
+
+test('mfa: enroll → activate → two-step login yields an acr=mfa session that clears step-up', async () => {
+  const created = await app.inject({ method: 'POST', url: '/admin/operators', headers: bearer(adminTok), payload: { email: 'mfatest@platform.example', display_name: 'MFA Test', operator_role: 'ops' } });
+  eq(created.statusCode, 200, 'admin created a fresh ops operator'); const newId = created.json().operator_id;
+  const apiKey = (await app.inject({ method: 'POST', url: `/admin/operators/${newId}/credential`, headers: bearer(adminTok) })).json().api_key;
+  const tok0 = await loginOp('mfatest@platform.example', apiKey);   // password-only for now
+  const enroll = (await app.inject({ method: 'POST', url: '/operator/mfa/enroll', headers: bearer(tok0) })).json();
+  if (!enroll.secret) throw new Error('no enroll secret');
+  eq((await app.inject({ method: 'POST', url: '/operator/mfa/activate', headers: bearer(tok0), payload: { code: '000000' } })).statusCode, 401, 'wrong activation code rejected');
+  const act = await app.inject({ method: 'POST', url: '/operator/mfa/activate', headers: bearer(tok0), payload: { code: totp(enroll.secret) } });
+  eq(act.statusCode, 200, 'activate with a live TOTP'); if (!(act.json().recovery_codes || []).length) throw new Error('no recovery codes issued');
+  const step1 = (await app.inject({ method: 'POST', url: '/operator/login', payload: { email: 'mfatest@platform.example', api_key: apiKey } })).json();
+  eq(step1.mfa_required, true, 'login now demands a second factor');
+  eq((await app.inject({ method: 'POST', url: '/operator/mfa/verify', payload: { mfa_token: step1.mfa_token, code: '000000' } })).statusCode, 401, 'wrong TOTP rejected');
+  const step2 = await app.inject({ method: 'POST', url: '/operator/mfa/verify', payload: { mfa_token: step1.mfa_token, code: totp(enroll.secret) } });
+  eq(step2.statusCode, 200, 'correct TOTP completes login'); eq(step2.json().acr, 'mfa', 'session is acr=mfa');
+  eq((await app.inject({ method: 'GET', url: '/admin/offboarding/00000000-0000-0000-0000-0000000000aa', headers: bearer(step2.json().operator_token) })).statusCode, 404, 'MFA ops now passes step-up (404, not 403)');
+});
+
+test('mfa: recovery-code login works and the code is single-use', async () => {
+  const s1 = (await app.inject({ method: 'POST', url: '/operator/login', payload: { email: 'ops1@platform.example', api_key: 'opk_op3_key_cccccccc' } })).json();
+  const r = await app.inject({ method: 'POST', url: '/operator/mfa/verify', payload: { mfa_token: s1.mfa_token, recovery_code: 'rc_known_op3_001' } });
+  eq(r.statusCode, 200, 'recovery code logs in'); eq(r.json().acr, 'mfa', 'acr=mfa');
+  const s1b = (await app.inject({ method: 'POST', url: '/operator/login', payload: { email: 'ops1@platform.example', api_key: 'opk_op3_key_cccccccc' } })).json();
+  eq((await app.inject({ method: 'POST', url: '/operator/mfa/verify', payload: { mfa_token: s1b.mfa_token, recovery_code: 'rc_known_op3_001' } })).statusCode, 401, 'the recovery code is single-use');
+});
+
+test('sso: a validly-signed IdP assertion logs the linked operator in; tamper/aud/domain are rejected', async () => {
+  const sign = (o) => { const p = Buffer.from(JSON.stringify(o)).toString('base64url'); return `${p}.${createHmac('sha256', 'sso-demo-secret-key').update(p).digest('hex')}`; };
+  const exp = Math.floor(Date.now() / 1000) + 300;
+  const good = sign({ iss: 'https://idp.example', aud: 'hub-operators', sub: 'ext-op1', email: 'op1@partner.example', exp });
+  const r = await app.inject({ method: 'POST', url: '/operator/sso/login', payload: { idp: 'demo-oidc', assertion: good } });
+  eq(r.statusCode, 200, 'SSO login ok'); if (!r.json().operator_token) throw new Error('no SSO token');
+  eq((await app.inject({ method: 'POST', url: '/operator/sso/login', payload: { idp: 'demo-oidc', assertion: good.slice(0, -4) + 'dead' } })).statusCode, 401, 'tampered signature rejected');
+  const badAud = sign({ iss: 'https://idp.example', aud: 'someone-else', sub: 'ext-op1', exp });
+  eq((await app.inject({ method: 'POST', url: '/operator/sso/login', payload: { idp: 'demo-oidc', assertion: badAud } })).statusCode, 401, 'wrong audience rejected');
+  const badDom = sign({ iss: 'https://idp.example', aud: 'hub-operators', sub: 'ext-evil', email: 'evil@attacker.example', exp });
+  eq((await app.inject({ method: 'POST', url: '/operator/sso/login', payload: { idp: 'demo-oidc', assertion: badDom } })).json().error, 'DOMAIN_NOT_ALLOWED', 'JIT is restricted to the IdP allowed_domain');
+});
+
+test('mfa: an admin can reset an operator’s MFA (step-up), restoring password-only login', async () => {
+  const rst = await app.inject({ method: 'POST', url: '/admin/operators/0b000000-0000-0000-0000-000000000003/mfa/reset', headers: bearer(adminTok) });
+  eq(rst.statusCode, 200, 'admin MFA reset ok');
+  const after = (await app.inject({ method: 'POST', url: '/operator/login', payload: { email: 'ops1@platform.example', api_key: 'opk_op3_key_cccccccc' } })).json();
+  if (!after.operator_token) throw new Error('expected a full token after MFA reset'); eq(after.acr, 'pwd', 'password-only after reset');
 });
 
 let pass = 0, fail = 0;

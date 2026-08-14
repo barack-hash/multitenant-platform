@@ -7,7 +7,8 @@ import { randomUUID, createHash, createHmac, timingSafeEqual } from 'node:crypto
 import { withUserContext, withServiceContext } from './db.js';
 import { mintHubToken, verifyHubToken, gucsFromClaims,
          mintLaunchToken, verifyLaunchToken, mintSpokeToken, verifySpokeToken, mintSupportToken,
-         mintOperatorToken, verifyOperatorToken } from './tokens.js';
+         mintOperatorToken, verifyOperatorToken, mintOperatorMfaToken, verifyOperatorMfaToken } from './tokens.js';
+import { generateTotpSecret, verifyTotp, otpauthUri } from './mfa.js';
 import { cfg } from './config.js';
 
 const sha256 = (s) => createHash('sha256').update(s).digest('hex');
@@ -420,7 +421,7 @@ export function buildServer() {
     if (m) {
       let claims; try { claims = verifyOperatorToken(m[1]); } catch { return reply.code(401).send({ error: 'invalid operator token' }); }
       if (!(await operatorLive(claims.osid))) return reply.code(401).send({ error: 'OPERATOR_SESSION_INACTIVE' });
-      req.operator = { id: claims.sub, role: claims.orole, osid: claims.osid };
+      req.operator = { id: claims.sub, role: claims.orole, osid: claims.osid, acr: claims.acr || 'pwd' };
       return;
     }
     if (req.headers['x-admin-token']) {                       // break-glass (env-gated, loudly audited)
@@ -441,6 +442,15 @@ export function buildServer() {
     await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.role_denied', actor_ref: req.operator.id,
       resource_type: 'endpoint', resource_ref: req.url, outcome: 'denied', reason_code: 'ROLE_REQUIRED' });
     reply.code(403).send({ error: 'OPERATOR_ROLE_REQUIRED', allowed });
+    return false;
+  };
+
+  // Step-up guard (group 12): the session must carry acr='mfa'. Break-glass counts as admin-equivalent.
+  const requireMfa = async (req, reply) => {
+    if (req.operator?.breakglass || req.operator.acr === 'mfa') return true;
+    await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.stepup_required', actor_ref: req.operator.id,
+      resource_type: 'endpoint', resource_ref: req.url, outcome: 'denied', reason_code: 'MFA_REQUIRED' });
+    reply.code(403).send({ error: 'MFA_REQUIRED', detail: 're-authenticate with a second factor for this action' });
     return false;
   };
 
@@ -465,6 +475,7 @@ export function buildServer() {
   // Start an offboarding job for a tenant (phase 'requested').
   app.post('/admin/offboarding/start', { preHandler: operatorAuth }, async (req, reply) => {
     if (!await requireRole(req, reply, ['ops', 'admin'])) return;
+    if (!await requireMfa(req, reply)) return;
     const { tenant, reason, retention_policy_key = 'offboarding-default' } = req.body || {};
     if (!tenant) return reply.code(400).send({ error: 'tenant (slug) is required' });
     try {
@@ -488,6 +499,7 @@ export function buildServer() {
   // Advance the state machine (enforces the §13 DAG + legal-hold/export/retention/completion gates).
   app.post('/admin/offboarding/:id/advance', { preHandler: operatorAuth }, async (req, reply) => {
     if (!await requireRole(req, reply, ['ops', 'admin'])) return;
+    if (!await requireMfa(req, reply)) return;
     const { to } = req.body || {};
     if (!to) return reply.code(400).send({ error: 'target phase "to" is required' });
     try {
@@ -505,6 +517,7 @@ export function buildServer() {
   // Persist an export verification receipt (the export completion gate, §10).
   app.post('/admin/offboarding/:id/export-verify', { preHandler: operatorAuth }, async (req, reply) => {
     if (!await requireRole(req, reply, ['ops', 'admin'])) return;
+    if (!await requireMfa(req, reply)) return;
     const { manifest_hash = 'demo-manifest', signature_valid = true, checksum_valid = true } = req.body || {};
     const out = await withServiceContext('svc_lifecycle', async (c) => {
       const j = (await c.query('select tenant_id from tenant_offboarding_jobs where id=$1', [req.params.id])).rows[0];
@@ -524,6 +537,7 @@ export function buildServer() {
   // Run the data-plane purge (only valid in purge_started) — writes cache + search receipts.
   app.post('/admin/offboarding/:id/purge', { preHandler: operatorAuth }, async (req, reply) => {
     if (!await requireRole(req, reply, ['ops', 'admin'])) return;
+    if (!await requireMfa(req, reply)) return;
     try {
       const pj = await withServiceContext('svc_lifecycle', (c) =>
         c.query('select app.execute_tenant_purge($1,$2) pj', [req.params.id, req.operator.id]))
@@ -539,6 +553,7 @@ export function buildServer() {
   // Inspect a job + its receipts and purge summary.
   app.get('/admin/offboarding/:id', { preHandler: operatorAuth }, async (req, reply) => {
     if (!await requireRole(req, reply, ['ops', 'admin'])) return;
+    if (!await requireMfa(req, reply)) return;
     const out = await withServiceContext('svc_lifecycle', async (c) => {
       const job = (await c.query('select * from tenant_offboarding_jobs where id=$1', [req.params.id])).rows[0];
       if (!job) return null;
@@ -558,6 +573,7 @@ export function buildServer() {
   // Place a legal hold on a tenant (blocks purge progression, §13).
   app.post('/admin/legal-hold', { preHandler: operatorAuth }, async (req, reply) => {
     if (!await requireRole(req, reply, ['ops', 'admin'])) return;
+    if (!await requireMfa(req, reply)) return;
     const { tenant, reason, reference } = req.body || {};
     if (!tenant || !reason) return reply.code(400).send({ error: 'tenant (slug) and reason are required' });
     const out = await withServiceContext('svc_lifecycle', async (c) => {
@@ -575,6 +591,7 @@ export function buildServer() {
   // Release a legal hold (unblocks purge progression).
   app.post('/admin/legal-hold/:id/release', { preHandler: operatorAuth }, async (req, reply) => {
     if (!await requireRole(req, reply, ['ops', 'admin'])) return;
+    if (!await requireMfa(req, reply)) return;
     const n = await withServiceContext('svc_lifecycle', (c) =>
       c.query("update legal_holds set status='released', released_at=now(), released_by=$2 where id=$1 and status='active'",
         [req.params.id, req.operator.id]));
@@ -620,12 +637,19 @@ export function buildServer() {
         actor_ref: String(email).slice(0, 80), outcome: 'denied', reason_code: 'BAD_CREDENTIAL' });
       return reply.code(401).send({ error: 'invalid operator credentials' });
     }
+    // Group 12: an MFA-enrolled operator gets only a short-lived pending-MFA challenge from factor 1.
+    const hasMfa = await withServiceContext('svc_ops', (c) =>
+      c.query('select app.operator_has_active_mfa($1) m', [authed.operator_id])).then((r) => r.rows[0].m);
+    if (hasMfa) {
+      await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.login.mfa_challenge', actor_ref: authed.operator_id, outcome: 'success' });
+      return { mfa_required: true, mfa_token: mintOperatorMfaToken({ operator_id: authed.operator_id }), token_type: 'pending-mfa', expires_in: cfg.operatorMfaTtlSec };
+    }
     const osid = await withServiceContext('svc_ops', (c) =>
-      c.query('select app.start_operator_session($1,$2) id', [authed.operator_id, cfg.operatorTokenTtlSec])).then((r) => r.rows[0].id);
+      c.query("select app.start_operator_session($1,$2,'pwd','pwd') id", [authed.operator_id, cfg.operatorTokenTtlSec])).then((r) => r.rows[0].id);
     await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.login', actor_ref: authed.operator_id,
       resource_type: 'operator_session', resource_ref: osid, outcome: 'success' });
-    const operator_token = mintOperatorToken({ operator_id: authed.operator_id, operator_role: authed.operator_role, osid });
-    return { operator_token, token_type: 'Bearer', operator_role: authed.operator_role, expires_in: cfg.operatorTokenTtlSec };
+    const operator_token = mintOperatorToken({ operator_id: authed.operator_id, operator_role: authed.operator_role, osid, amr: ['pwd'], acr: 'pwd' });
+    return { operator_token, token_type: 'Bearer', operator_role: authed.operator_role, acr: 'pwd', expires_in: cfg.operatorTokenTtlSec };
   });
 
   // Operator logout: revoke the caller's session — its token dies immediately (before TTL).
@@ -637,9 +661,114 @@ export function buildServer() {
     return { revoked: n };
   });
 
+  // ---- group 12: operator MFA (TOTP) + SSO ----
+
+  // Enroll TOTP for the calling operator: returns the secret + otpauth URI for an authenticator app.
+  app.post('/operator/mfa/enroll', { preHandler: operatorAuth }, async (req) => {
+    const secret = generateTotpSecret();
+    await withServiceContext('svc_ops', (c) => c.query('select app.operator_mfa_begin_enroll($1,$2)', [req.operator.id, secret]));
+    await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.mfa.enroll_started', actor_ref: req.operator.id, outcome: 'success' });
+    return { secret, otpauth_uri: otpauthUri(cfg.mfaIssuer, req.operator.id, secret), note: 'add to your authenticator, then POST /operator/mfa/activate {code}' };
+  });
+
+  // Activate the pending enrollment by proving a live code; returns one-time recovery codes (shown once).
+  app.post('/operator/mfa/activate', { preHandler: operatorAuth }, async (req, reply) => {
+    const { code } = req.body || {};
+    const mfa = await withServiceContext('svc_ops', (c) => c.query('select * from app.operator_mfa_get($1)', [req.operator.id])).then((r) => r.rows[0]);
+    if (!mfa || mfa.status !== 'pending') return reply.code(409).send({ error: 'no pending enrollment' });
+    if (!verifyTotp(mfa.secret, code)) {
+      await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.mfa.activate', actor_ref: req.operator.id, outcome: 'denied', reason_code: 'BAD_CODE' });
+      return reply.code(401).send({ error: 'INVALID_CODE' });
+    }
+    await withServiceContext('svc_ops', (c) => c.query('select app.operator_mfa_activate($1)', [req.operator.id]));
+    const codes = Array.from({ length: 8 }, () => `rc_${randomUUID().replace(/-/g, '').slice(0, 10)}`);
+    await withServiceContext('svc_ops', (c) => c.query('select app.operator_add_recovery_codes($1,$2::text[])', [req.operator.id, codes.map(sha256)]));
+    await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.mfa.activated', actor_ref: req.operator.id, outcome: 'success' });
+    return { mfa: 'active', recovery_codes: codes, note: 'store these recovery codes now — shown once' };
+  });
+
+  // Complete login: exchange a pending-MFA token + a TOTP (or recovery) code for a full session token.
+  app.post('/operator/mfa/verify', async (req, reply) => {
+    const { mfa_token, code, recovery_code } = req.body || {};
+    if (!mfa_token) return reply.code(400).send({ error: 'mfa_token is required' });
+    let opId; try { opId = verifyOperatorMfaToken(mfa_token).sub; } catch { return reply.code(401).send({ error: 'invalid or expired mfa_token' }); }
+    const mfa = await withServiceContext('svc_ops', (c) => c.query('select * from app.operator_mfa_get($1)', [opId])).then((r) => r.rows[0]);
+    if (!mfa || mfa.status !== 'active') return reply.code(409).send({ error: 'no active MFA' });
+    if (mfa.locked) {
+      await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.mfa.verify', actor_ref: opId, outcome: 'denied', reason_code: 'LOCKED' });
+      return reply.code(429).send({ error: 'MFA_LOCKED', detail: 'too many failed attempts; try again later' });
+    }
+    let ok = false, method = 'otp';
+    if (recovery_code) { ok = await withServiceContext('svc_ops', (c) => c.query('select app.operator_consume_recovery_code($1,$2) ok', [opId, sha256(recovery_code)])).then((r) => r.rows[0].ok); method = 'recovery'; }
+    else ok = verifyTotp(mfa.secret, code);
+    await withServiceContext('svc_ops', (c) => c.query('select app.operator_mfa_record($1,$2)', [opId, ok]));
+    if (!ok) {
+      await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.mfa.verify', actor_ref: opId, outcome: 'denied', reason_code: 'BAD_CODE' });
+      return reply.code(401).send({ error: 'INVALID_CODE' });
+    }
+    const op = await withServiceContext('svc_ops', (c) => c.query('select operator_role from platform_operators where id=$1', [opId])).then((r) => r.rows[0]);
+    const osid = await withServiceContext('svc_ops', (c) => c.query("select app.start_operator_session($1,$2,$3,'mfa') id", [opId, cfg.operatorTokenTtlSec, `pwd,${method}`])).then((r) => r.rows[0].id);
+    await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.login', actor_ref: opId, resource_type: 'operator_session', resource_ref: osid, outcome: 'success', meta: { acr: 'mfa', method } });
+    const operator_token = mintOperatorToken({ operator_id: opId, operator_role: op.operator_role, osid, amr: ['pwd', method], acr: 'mfa' });
+    return { operator_token, token_type: 'Bearer', operator_role: op.operator_role, acr: 'mfa', expires_in: cfg.operatorTokenTtlSec };
+  });
+
+  // Admin: reset an operator's MFA (disables it + clears recovery codes). §12 sensitive; admin + step-up.
+  app.post('/admin/operators/:id/mfa/reset', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['admin'])) return;
+    if (!await requireMfa(req, reply)) return;
+    const n = await withServiceContext('svc_ops', (c) => c.query('select app.operator_reset_mfa($1,$2) n', [req.params.id, 'admin_reset'])).then((r) => Number(r.rows[0].n));
+    await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.mfa.reset', actor_ref: req.operator.id, resource_type: 'operator', resource_ref: req.params.id, outcome: 'success', meta: { disabled: n } });
+    return { operator_id: req.params.id, mfa_reset: true };
+  });
+
+  // SSO login: verify a signed IdP assertion → resolve/JIT the operator → session (amr=['sso']). The
+  // assertion is `base64url(json).hmac-sha256(secret,payload)` — an MVP stand-in for OIDC JWKS / SAML x509
+  // (the live redirect/code-exchange handshake is deferred; the trust contract is what's implemented).
+  app.post('/operator/sso/login', async (req, reply) => {
+    const { idp, assertion } = req.body || {};
+    if (!idp || !assertion) return reply.code(400).send({ error: 'idp and assertion are required' });
+    const provider = await withServiceContext('svc_ops', (c) => c.query("select * from operator_idp where idp_key=$1 and status='active'", [idp])).then((r) => r.rows[0]);
+    if (!provider) return reply.code(404).send({ error: 'unknown idp' });
+    let claims;
+    try {
+      const [payloadB64, sig] = String(assertion).split('.');
+      const expected = createHmac('sha256', provider.signing_secret).update(payloadB64 || '').digest('hex');
+      if (!sig || sig.length !== expected.length || !timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) throw new Error('sig');
+      claims = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+    } catch {
+      await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.sso.login', actor_ref: String(idp).slice(0, 40), outcome: 'denied', reason_code: 'BAD_ASSERTION' });
+      return reply.code(401).send({ error: 'INVALID_ASSERTION' });
+    }
+    const now = Math.floor(Date.now() / 1000);
+    if (claims.iss !== provider.issuer || claims.aud !== provider.audience || !claims.sub || (claims.exp && claims.exp < now)) {
+      await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.sso.login', actor_ref: String(idp).slice(0, 40), outcome: 'denied', reason_code: 'ASSERTION_REJECTED' });
+      return reply.code(401).send({ error: 'ASSERTION_REJECTED' });
+    }
+    let resolved;
+    try {
+      resolved = await withServiceContext('svc_ops', (c) => c.query('select * from app.operator_sso_login($1,$2,$3)',
+        [provider.id, claims.sub, claims.email || `${claims.sub}@${provider.allowed_domain || 'unknown'}`])).then((r) => r.rows[0]);
+    } catch (e) {
+      const reason = /DOMAIN_NOT_ALLOWED/.test(e.message) ? 'DOMAIN_NOT_ALLOWED' : /duplicate|unique/.test(e.message) ? 'EMAIL_EXISTS' : 'SSO_FAILED';
+      await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.sso.login', actor_ref: String(idp).slice(0, 40), resource_ref: claims.sub, outcome: 'denied', reason_code: reason });
+      return reply.code(403).send({ error: reason });
+    }
+    if (!resolved) {
+      await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.sso.login', actor_ref: String(idp).slice(0, 40), resource_ref: claims.sub, outcome: 'denied', reason_code: 'NO_LINK' });
+      return reply.code(401).send({ error: 'NO_FEDERATED_IDENTITY' });
+    }
+    const acr = Array.isArray(claims.amr) && claims.amr.includes('mfa') ? 'mfa' : 'sso';
+    const osid = await withServiceContext('svc_ops', (c) => c.query("select app.start_operator_session($1,$2,'sso',$3) id", [resolved.operator_id, cfg.operatorTokenTtlSec, acr])).then((r) => r.rows[0].id);
+    await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.sso.login', actor_ref: resolved.operator_id, resource_type: 'operator_session', resource_ref: osid, outcome: 'success', meta: { idp, jit: resolved.jit, acr } });
+    const operator_token = mintOperatorToken({ operator_id: resolved.operator_id, operator_role: resolved.operator_role, osid, amr: ['sso'], acr });
+    return { operator_token, token_type: 'Bearer', operator_role: resolved.operator_role, acr, jit_provisioned: resolved.jit, expires_in: cfg.operatorTokenTtlSec };
+  });
+
   // Create a platform operator (admin only).
   app.post('/admin/operators', { preHandler: operatorAuth }, async (req, reply) => {
     if (!await requireRole(req, reply, ['admin'])) return;
+    if (!await requireMfa(req, reply)) return;
     const { email, display_name, operator_role = 'support' } = req.body || {};
     if (!email || !display_name) return reply.code(400).send({ error: 'email and display_name are required' });
     try {
@@ -655,6 +784,7 @@ export function buildServer() {
   // Issue an API-key credential for an operator (admin only). Returns the raw key ONCE.
   app.post('/admin/operators/:id/credential', { preHandler: operatorAuth }, async (req, reply) => {
     if (!await requireRole(req, reply, ['admin'])) return;
+    if (!await requireMfa(req, reply)) return;
     const api_key = `opk_${randomUUID().replace(/-/g, '')}`;      // opaque high-entropy key
     const key_prefix = api_key.slice(0, 12), secret_hash = sha256(api_key);
     try {
@@ -872,6 +1002,7 @@ export function buildServer() {
   // insert-once anchor point (idempotent); the external WORM/notary sink is a Tier-B deferral.
   app.post('/admin/audit/anchor', { preHandler: operatorAuth }, async (req, reply) => {
     if (!await requireRole(req, reply, ['ops', 'admin'])) return;
+    if (!await requireMfa(req, reply)) return;
     const chain = (req.body && req.body.chain) || req.query.chain;
     if (!chain) return reply.code(400).send({ error: 'chain required (tenant slug or "platform")' });
     const chainId = chain === 'platform' ? 'platform'

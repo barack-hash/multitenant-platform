@@ -12,6 +12,9 @@ export const cfg = {
   // Group 11: per-operator platform-ops auth. The operator token is aud='operator', bound to a live
   // operator_session. The shared adminToken is now ONLY a break-glass fallback, env-gated + audited.
   operatorTokenTtlSec: Number(process.env.OPERATOR_TOKEN_TTL || 1800),
+  // Group 12: operator MFA (TOTP) + SSO. The pending-MFA token is short-lived (login step 1 → step 2).
+  operatorMfaTtlSec: Number(process.env.OPERATOR_MFA_TTL || 300),
+  mfaIssuer: process.env.MFA_ISSUER || 'hub-operators',
   adminToken: process.env.ADMIN_API_TOKEN || 'dev-admin-token',
   breakGlassEnabled: ['1', 'true', 'yes'].includes(String(process.env.BREAKGLASS_ENABLED || '').toLowerCase()),
   port: Number(process.env.PORT || 3000),
