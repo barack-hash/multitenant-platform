@@ -3,12 +3,13 @@ import Fastify from 'fastify';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { randomUUID, createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { randomUUID, randomBytes, createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { withUserContext, withServiceContext } from './db.js';
 import { mintHubToken, verifyHubToken, gucsFromClaims,
          mintLaunchToken, verifyLaunchToken, mintSpokeToken, verifySpokeToken, mintSupportToken,
          mintOperatorToken, verifyOperatorToken, mintOperatorMfaToken, verifyOperatorMfaToken } from './tokens.js';
 import { generateTotpSecret, verifyTotp, otpauthUri } from './mfa.js';
+import { verifyRegistration, verifyAssertion } from './webauthn.js';
 import { cfg } from './config.js';
 
 const sha256 = (s) => createHash('sha256').update(s).digest('hex');
@@ -763,6 +764,101 @@ export function buildServer() {
     await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.sso.login', actor_ref: resolved.operator_id, resource_type: 'operator_session', resource_ref: osid, outcome: 'success', meta: { idp, jit: resolved.jit, acr } });
     const operator_token = mintOperatorToken({ operator_id: resolved.operator_id, operator_role: resolved.operator_role, osid, amr: ['sso'], acr });
     return { operator_token, token_type: 'Bearer', operator_role: resolved.operator_role, acr, jit_provisioned: resolved.jit, expires_in: cfg.operatorTokenTtlSec };
+  });
+
+  // ---- group 13: WebAuthn / passkeys (phishing-resistant public-key auth) ----
+  const webauthnRp = { id: cfg.webauthnRpId, name: cfg.webauthnRpName };
+  const newChallenge = () => randomBytes(32).toString('base64url');
+  const webauthnError = (e) => /WEBAUTHN_[A-Z_]+/.exec(String(e.message))?.[0] || null;
+
+  // Register a passkey from an authenticated operator session. Step 1: options + challenge.
+  app.post('/operator/webauthn/register/begin', { preHandler: operatorAuth }, async (req) => {
+    const challenge = newChallenge();
+    const challengeId = await withServiceContext('svc_ops', (c) => c.query("select app.webauthn_new_challenge($1,'registration',$2) id", [req.operator.id, challenge])).then((r) => r.rows[0].id);
+    return {
+      challenge_id: challengeId, challenge, rp: webauthnRp,
+      user: { id: req.operator.id, name: req.operator.id, displayName: `operator (${req.operator.role})` },
+      pubKeyCredParams: [{ type: 'public-key', alg: -7 }],
+      authenticatorSelection: { residentKey: 'preferred', userVerification: 'preferred' }, timeout: 300000,
+    };
+  });
+
+  // Step 2: verify the attestation and store the PUBLIC-key credential.
+  app.post('/operator/webauthn/register/finish', { preHandler: operatorAuth }, async (req, reply) => {
+    const { challenge_id, attestationObject, clientDataJSON, nickname } = req.body || {};
+    if (!challenge_id || !attestationObject || !clientDataJSON) return reply.code(400).send({ error: 'challenge_id, attestationObject, clientDataJSON are required' });
+    const ch = await withServiceContext('svc_ops', (c) => c.query("select * from app.webauthn_consume_challenge($1,'registration')", [challenge_id])).then((r) => r.rows[0]);
+    if (!ch || ch.operator_id !== req.operator.id) return reply.code(400).send({ error: 'WEBAUTHN_CHALLENGE_INVALID' });
+    let reg;
+    try { reg = verifyRegistration({ attestationObject, clientDataJSON, expectedChallenge: ch.challenge, expectedOrigin: cfg.webauthnOrigin, expectedRpId: cfg.webauthnRpId }); }
+    catch (e) {
+      await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.webauthn.register', actor_ref: req.operator.id, outcome: 'denied', reason_code: webauthnError(e) || 'REG_FAILED' });
+      return reply.code(400).send({ error: webauthnError(e) || 'WEBAUTHN_REGISTRATION_FAILED' });
+    }
+    try {
+      const credId = await withServiceContext('svc_ops', (c) => c.query('select app.webauthn_add_credential($1,$2,$3::jsonb,$4,$5,$6,$7) id',
+        [req.operator.id, reg.credentialId, JSON.stringify(reg.publicKeyJwk), reg.signCount, null, reg.aaguid, nickname || null])).then((r) => r.rows[0].id);
+      await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.webauthn.registered', actor_ref: req.operator.id, resource_type: 'webauthn_credential', resource_ref: reg.credentialId, outcome: 'success' });
+      return { credential_id: reg.credentialId, id: credId, registered: true };
+    } catch (e) { return reply.code(409).send({ error: /duplicate|unique/.test(e.message) ? 'CREDENTIAL_ALREADY_REGISTERED' : 'REGISTER_FAILED' }); }
+  });
+
+  // Passwordless login step 1: resolve the operator by email → challenge + allowed credentials.
+  app.post('/operator/webauthn/login/begin', async (req, reply) => {
+    const { email } = req.body || {};
+    if (!email) return reply.code(400).send({ error: 'email is required' });
+    const op = await withServiceContext('svc_ops', (c) => c.query("select id from platform_operators where email=$1 and status='active'", [email])).then((r) => r.rows[0]);
+    if (!op) return reply.code(404).send({ error: 'no such operator' });
+    const creds = await withServiceContext('svc_ops', (c) => c.query('select credential_id from app.webauthn_active_credential_ids($1)', [op.id])).then((r) => r.rows.map((x) => x.credential_id));
+    if (!creds.length) return reply.code(404).send({ error: 'no passkeys registered' });
+    const challenge = newChallenge();
+    const challengeId = await withServiceContext('svc_ops', (c) => c.query("select app.webauthn_new_challenge($1,'authentication',$2) id", [op.id, challenge])).then((r) => r.rows[0].id);
+    return { challenge_id: challengeId, challenge, rpId: cfg.webauthnRpId, allowCredentials: creds.map((id) => ({ type: 'public-key', id })), userVerification: 'preferred' };
+  });
+
+  // Passwordless login step 2: verify the assertion → phishing-resistant session (amr=['webauthn'], acr='mfa').
+  app.post('/operator/webauthn/login/finish', async (req, reply) => {
+    const { challenge_id, credentialId, authenticatorData, clientDataJSON, signature } = req.body || {};
+    if (!challenge_id || !credentialId || !authenticatorData || !clientDataJSON || !signature) return reply.code(400).send({ error: 'missing assertion fields' });
+    const ch = await withServiceContext('svc_ops', (c) => c.query("select * from app.webauthn_consume_challenge($1,'authentication')", [challenge_id])).then((r) => r.rows[0]);
+    if (!ch) return reply.code(401).send({ error: 'WEBAUTHN_CHALLENGE_INVALID' });
+    const cred = await withServiceContext('svc_ops', (c) => c.query('select * from app.webauthn_get_credential($1)', [credentialId])).then((r) => r.rows[0]);
+    if (!cred || cred.operator_id !== ch.operator_id) {
+      await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.webauthn.login', actor_ref: ch.operator_id, outcome: 'denied', reason_code: 'CREDENTIAL_MISMATCH' });
+      return reply.code(401).send({ error: 'WEBAUTHN_CREDENTIAL_MISMATCH' });
+    }
+    let res;
+    try { res = verifyAssertion({ authenticatorData, clientDataJSON, signature, publicKeyJwk: cred.public_key_jwk, expectedChallenge: ch.challenge, expectedOrigin: cfg.webauthnOrigin, expectedRpId: cfg.webauthnRpId }); }
+    catch (e) {
+      await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.webauthn.login', actor_ref: ch.operator_id, outcome: 'denied', reason_code: webauthnError(e) || 'ASSERTION_FAILED' });
+      return reply.code(401).send({ error: webauthnError(e) || 'WEBAUTHN_ASSERTION_FAILED' });
+    }
+    // A passwordless passkey session mints acr='mfa' → require USER VERIFICATION (biometric/PIN), so it's
+    // genuinely user-verified, not mere possession.
+    if (!res.uv) {
+      await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.webauthn.login', actor_ref: ch.operator_id, outcome: 'denied', reason_code: 'UV_REQUIRED' });
+      return reply.code(401).send({ error: 'WEBAUTHN_UV_REQUIRED' });
+    }
+    const bumped = await withServiceContext('svc_ops', (c) => c.query('select app.webauthn_bump_sign_count($1,$2) ok', [credentialId, res.newSignCount])).then((r) => r.rows[0].ok);
+    if (!bumped) {   // non-monotonic sign counter → possible cloned authenticator
+      await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.webauthn.login', actor_ref: ch.operator_id, outcome: 'denied', reason_code: 'SIGN_COUNT_REGRESSION' });
+      return reply.code(401).send({ error: 'WEBAUTHN_CLONE_DETECTED' });
+    }
+    const op = await withServiceContext('svc_ops', (c) => c.query('select operator_role from platform_operators where id=$1', [ch.operator_id])).then((r) => r.rows[0]);
+    const osid = await withServiceContext('svc_ops', (c) => c.query("select app.start_operator_session($1,$2,'webauthn','mfa') id", [ch.operator_id, cfg.operatorTokenTtlSec])).then((r) => r.rows[0].id);
+    await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.webauthn.login', actor_ref: ch.operator_id, resource_type: 'operator_session', resource_ref: osid, outcome: 'success', meta: { credential: credentialId, uv: res.uv } });
+    const operator_token = mintOperatorToken({ operator_id: ch.operator_id, operator_role: op.operator_role, osid, amr: ['webauthn'], acr: 'mfa' });
+    return { operator_token, token_type: 'Bearer', operator_role: op.operator_role, acr: 'mfa', amr: ['webauthn'], expires_in: cfg.operatorTokenTtlSec };
+  });
+
+  // List / revoke passkeys (self).
+  app.get('/operator/webauthn/credentials', { preHandler: operatorAuth }, async (req) => ({
+    credentials: await withServiceContext('svc_ops', (c) => c.query("select credential_id, nickname, sign_count, created_at, last_used_at from operator_webauthn_credentials where operator_id=$1 and status='active' order by created_at", [req.operator.id])).then((r) => r.rows),
+  }));
+  app.post('/operator/webauthn/credentials/:id/revoke', { preHandler: operatorAuth }, async (req) => {
+    const n = await withServiceContext('svc_ops', (c) => c.query('select app.webauthn_revoke($1,$2) n', [req.params.id, req.operator.id])).then((r) => Number(r.rows[0].n));
+    await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.webauthn.revoked', actor_ref: req.operator.id, resource_type: 'webauthn_credential', resource_ref: req.params.id, outcome: 'success' });
+    return { credential_id: req.params.id, revoked: n };
   });
 
   // Create a platform operator (admin only).

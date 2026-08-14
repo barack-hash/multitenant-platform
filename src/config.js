@@ -15,6 +15,10 @@ export const cfg = {
   // Group 12: operator MFA (TOTP) + SSO. The pending-MFA token is short-lived (login step 1 → step 2).
   operatorMfaTtlSec: Number(process.env.OPERATOR_MFA_TTL || 300),
   mfaIssuer: process.env.MFA_ISSUER || 'hub-operators',
+  // Group 13: WebAuthn / passkeys. rpId = the registrable domain; origin = the exact page origin.
+  webauthnRpId: process.env.WEBAUTHN_RP_ID || 'localhost',
+  webauthnRpName: process.env.WEBAUTHN_RP_NAME || 'MultiTenant Hub Operators',
+  webauthnOrigin: process.env.WEBAUTHN_ORIGIN || 'http://localhost:3939',
   adminToken: process.env.ADMIN_API_TOKEN || 'dev-admin-token',
   breakGlassEnabled: ['1', 'true', 'yes'].includes(String(process.env.BREAKGLASS_ENABLED || '').toLowerCase()),
   port: Number(process.env.PORT || 3000),

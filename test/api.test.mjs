@@ -4,6 +4,8 @@ import { buildServer } from '../src/server.js';
 import { closePools } from '../src/db.js';
 import { createHmac } from 'node:crypto';
 import { totp } from '../src/mfa.js';
+import { makeCredential } from '../src/webauthn.js';
+import { cfg } from '../src/config.js';
 
 function signedEvent(body) {
   const raw = JSON.stringify(body);
@@ -485,6 +487,48 @@ test('mfa: an admin can reset an operator’s MFA (step-up), restoring password-
   eq(rst.statusCode, 200, 'admin MFA reset ok');
   const after = (await app.inject({ method: 'POST', url: '/operator/login', payload: { email: 'ops1@platform.example', api_key: 'opk_op3_key_cccccccc' } })).json();
   if (!after.operator_token) throw new Error('expected a full token after MFA reset'); eq(after.acr, 'pwd', 'password-only after reset');
+});
+
+// ---- group 13: WebAuthn / passkeys (real ES256 ceremonies via src/webauthn.js) ----
+const pkEmail = 'pktest@platform.example';
+const pkAuthr = makeCredential(cfg.webauthnRpId);   // a simulated authenticator (real P-256 keypair)
+let pkCredId;
+
+test('passkey: an operator registers a passkey from an authenticated session', async () => {
+  const newId = (await app.inject({ method: 'POST', url: '/admin/operators', headers: bearer(adminTok), payload: { email: pkEmail, display_name: 'PK Test', operator_role: 'ops' } })).json().operator_id;
+  const key = (await app.inject({ method: 'POST', url: `/admin/operators/${newId}/credential`, headers: bearer(adminTok) })).json().api_key;
+  const tok = await loginOp(pkEmail, key);   // a password session, from which the operator adds a passkey
+  const begin = (await app.inject({ method: 'POST', url: '/operator/webauthn/register/begin', headers: bearer(tok) })).json();
+  const att = pkAuthr.attestation(begin.challenge, cfg.webauthnOrigin);
+  const fin = await app.inject({ method: 'POST', url: '/operator/webauthn/register/finish', headers: bearer(tok), payload: { challenge_id: begin.challenge_id, attestationObject: att.attestationObject, clientDataJSON: att.clientDataJSON, nickname: 'yubikey' } });
+  eq(fin.statusCode, 200, 'passkey registered'); pkCredId = fin.json().credential_id; if (!pkCredId) throw new Error('no credential id');
+});
+
+test('passkey: passwordless login yields a phishing-resistant session (acr=mfa) that clears step-up', async () => {
+  const lb = (await app.inject({ method: 'POST', url: '/operator/webauthn/login/begin', payload: { email: pkEmail } })).json();
+  if (!lb.allowCredentials.some((x) => x.id === pkCredId)) throw new Error('registered credential not offered');
+  const asr = pkAuthr.assertion(lb.challenge, cfg.webauthnOrigin);
+  const lf = await app.inject({ method: 'POST', url: '/operator/webauthn/login/finish', payload: { challenge_id: lb.challenge_id, ...asr } });
+  eq(lf.statusCode, 200, 'passwordless login'); eq(lf.json().acr, 'mfa', 'phishing-resistant → acr=mfa'); eq(lf.json().amr[0], 'webauthn', 'amr=webauthn');
+  eq((await app.inject({ method: 'GET', url: '/admin/offboarding/00000000-0000-0000-0000-0000000000aa', headers: bearer(lf.json().operator_token) })).statusCode, 404, 'passkey session clears step-up (404, not 403)');
+});
+
+test('passkey: origin mismatch, a consumed challenge, and a bad signature are all rejected', async () => {
+  const lb1 = (await app.inject({ method: 'POST', url: '/operator/webauthn/login/begin', payload: { email: pkEmail } })).json();
+  const badOrigin = pkAuthr.assertion(lb1.challenge, 'https://evil.example');
+  eq((await app.inject({ method: 'POST', url: '/operator/webauthn/login/finish', payload: { challenge_id: lb1.challenge_id, ...badOrigin } })).json().error, 'WEBAUTHN_ORIGIN_MISMATCH', 'origin mismatch rejected');
+  const reuse = pkAuthr.assertion(lb1.challenge, cfg.webauthnOrigin);
+  eq((await app.inject({ method: 'POST', url: '/operator/webauthn/login/finish', payload: { challenge_id: lb1.challenge_id, ...reuse } })).statusCode, 401, 'a consumed challenge cannot be reused (single-use)');
+  const lb2 = (await app.inject({ method: 'POST', url: '/operator/webauthn/login/begin', payload: { email: pkEmail } })).json();
+  const asr = pkAuthr.assertion(lb2.challenge, cfg.webauthnOrigin);
+  eq((await app.inject({ method: 'POST', url: '/operator/webauthn/login/finish', payload: { challenge_id: lb2.challenge_id, ...asr, signature: asr.signature.slice(0, -6) + 'AAAAAA' } })).statusCode, 401, 'a tampered signature is rejected');
+});
+
+test('passkey: a regressed sign counter is treated as a cloned authenticator', async () => {
+  const lb = (await app.inject({ method: 'POST', url: '/operator/webauthn/login/begin', payload: { email: pkEmail } })).json();
+  pkAuthr.setSignCount(0);   // roll the counter BACKWARD (what a cloned authenticator would do)
+  const asr = pkAuthr.assertion(lb.challenge, cfg.webauthnOrigin, { bump: false });
+  eq((await app.inject({ method: 'POST', url: '/operator/webauthn/login/finish', payload: { challenge_id: lb.challenge_id, ...asr } })).json().error, 'WEBAUTHN_CLONE_DETECTED', 'sign-count regression → clone detected');
 });
 
 let pass = 0, fail = 0;
