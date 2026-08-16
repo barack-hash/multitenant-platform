@@ -44,12 +44,20 @@ files, consent-gated minor data, a gated tenant-purge state machine, and an immu
 
 ## Layout
 ```
-db/migrations/  0000 roles … 0011 support/audit/ops   (append-only, numbered)
+db/migrations/  0000 roles … 0014 operator webauthn   (append-only, numbered)
 db/seed/        deterministic fixtures (tenants, users, RBAC, apps, plans, operators)
-src/            modular-monolith Hub runtime (Fastify): config · db · tokens · server
+src/            modular-monolith Hub runtime (Fastify): config · db · tokens · mfa · webauthn · server
 test/           isolation.mjs + one *.test.mjs per group + api.test.mjs (HTTP end-to-end)
+console/        Next.js/Vercel operator console (BFF over the Hub) — see console/README.md
 scripts/run-local.sh   one-command reproduce (no Docker required)
 ```
+
+## Operator console (`console/`)
+A Next.js (App Router) app — the operator-facing UI, deployed on Vercel (DEC-013). It drives the operator
+auth ladder (password → TOTP MFA + step-up → SSO → WebAuthn passkeys) and operator surfaces (audit chain,
+passkeys, and — via the same proxy — support & offboarding). It uses a **BFF**: the browser talks only to
+the console's own route handlers, which keep the operator token in an httpOnly cookie and proxy to the Hub
+(no token in client JS, no CORS). See [`console/README.md`](console/README.md).
 
 ## Run it
 Uses a disposable Homebrew `postgresql@16` cluster in `.localpg/` (own port, nothing system-wide);

@@ -422,7 +422,7 @@ export function buildServer() {
     if (m) {
       let claims; try { claims = verifyOperatorToken(m[1]); } catch { return reply.code(401).send({ error: 'invalid operator token' }); }
       if (!(await operatorLive(claims.osid))) return reply.code(401).send({ error: 'OPERATOR_SESSION_INACTIVE' });
-      req.operator = { id: claims.sub, role: claims.orole, osid: claims.osid, acr: claims.acr || 'pwd' };
+      req.operator = { id: claims.sub, role: claims.orole, osid: claims.osid, acr: claims.acr || 'pwd', amr: claims.amr || [] };
       return;
     }
     if (req.headers['x-admin-token']) {                       // break-glass (env-gated, loudly audited)
@@ -660,6 +660,14 @@ export function buildServer() {
     await auditAppend('svc_ops', { chain_id: 'platform', action: 'operator.logout', actor_ref: req.operator.id,
       resource_type: 'operator_session', resource_ref: req.operator.osid, outcome: 'success' });
     return { revoked: n };
+  });
+
+  // The authenticated operator's own identity + assurance level (for the console dashboard).
+  app.get('/operator/me', { preHandler: operatorAuth }, async (req) => {
+    const op = await withServiceContext('svc_ops', (c) =>
+      c.query('select email, display_name, operator_role, status from platform_operators where id=$1', [req.operator.id])).then((r) => r.rows[0]);
+    return { operator_id: req.operator.id, email: op?.email ?? null, display_name: op?.display_name ?? null,
+      role: req.operator.role, acr: req.operator.acr, amr: req.operator.amr, breakglass: !!req.operator.breakglass };
   });
 
   // ---- group 12: operator MFA (TOTP) + SSO ----
