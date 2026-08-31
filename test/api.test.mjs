@@ -271,6 +271,41 @@ test('offboarding: start creates a requested job for the tenant', async () => {
   eq(r.json().phase, 'requested', 'starts at requested'); if (!obJobId) throw new Error('no job id');
 });
 
+test('offboarding: the job LIST carries gate status and inherits the role + step-up gate', async () => {
+  const l = await app.inject({ method: 'GET', url: '/admin/offboarding?tenant=tenant-three', headers: adminHdr });
+  eq(l.statusCode, 200, 'list status');
+  const row = (l.json().jobs || []).find((j) => j.id === obJobId);
+  if (!row) throw new Error('the live job is missing from the list');
+  eq(row.phase, 'requested', 'listed phase'); eq(row.tenant_slug, 'tenant-three', 'tenant slug joined');
+  eq(row.retention_policy_key, 'offboarding-default', 'retention policy joined');
+  eq(row.legal_hold_active, false, 'no hold yet'); eq(row.completion_ready, false, 'no receipts yet');
+  // A list may never be a way around the gate its actions carry.
+  const bySupport = await app.inject({ method: 'GET', url: '/admin/offboarding', headers: bearer(supTokA) });
+  eq(bySupport.statusCode, 403, 'support role denied'); eq(bySupport.json().error, 'OPERATOR_ROLE_REQUIRED', 'code');
+  const pwdOnlyOps = await loginOp('ops2@platform.example', 'opk_op5_key_eeeeeeee');
+  const noStepUp = await app.inject({ method: 'GET', url: '/admin/offboarding', headers: bearer(pwdOnlyOps) });
+  eq(noStepUp.statusCode, 403, 'pwd-only ops denied'); eq(noStepUp.json().error, 'MFA_REQUIRED', 'code');
+});
+
+test('offboarding: /admin/tenants flags the tenant that already has a live lifecycle job', async () => {
+  const r = await app.inject({ method: 'GET', url: '/admin/tenants', headers: adminHdr });
+  eq(r.statusCode, 200, 'tenants status');
+  const t3 = (r.json().tenants || []).find((t) => t.slug === 'tenant-three');
+  if (!t3) throw new Error('tenant-three missing'); eq(t3.live_offboarding_job_id, obJobId, 'live job surfaced');
+  const t1 = (r.json().tenants || []).find((t) => t.slug === 'tenant-one');
+  if (t1.live_offboarding_job_id) throw new Error('tenant-one should have no live job');
+  // The support panel needs the same picker, so support may read it (no step-up either).
+  eq((await app.inject({ method: 'GET', url: '/admin/tenants', headers: bearer(supTokA) })).statusCode, 200, 'support may list tenants');
+});
+
+test('offboarding: /admin/retention-policies exposes the §15 catalog the start form needs', async () => {
+  const r = await app.inject({ method: 'GET', url: '/admin/retention-policies', headers: adminHdr });
+  eq(r.statusCode, 200, 'policies status');
+  const p = (r.json().policies || []).find((x) => x.policy_key === 'offboarding-default');
+  if (!p) throw new Error('offboarding-default policy missing'); eq(p.retention_days, 0, 'retention days');
+  eq((await app.inject({ method: 'GET', url: '/admin/retention-policies', headers: bearer(supTokA) })).statusCode, 403, 'support role denied the lifecycle catalog');
+});
+
 test('offboarding: a tenant write works while ACTIVE (baseline before freeze)', async () => {
   const tok = (await login('u4@example.com', 'tenant-three')).json().token;
   const r = await app.inject({ method: 'POST', url: '/students', headers: bearer(tok), payload: { full_name: 'T3 Pupil' } });
@@ -317,6 +352,17 @@ test('offboarding: completion needs cache+search receipts; then tombstone delete
   eq(g.json().job.phase, 'tombstoned', 'inspect shows tombstoned'); eq(g.json().completion_ready, true, 'all receipts present');
   // The tenant is now deleted — it can no longer be logged into.
   eq((await login('u4@example.com', 'tenant-three')).statusCode, 401, 'deleted tenant rejects login');
+});
+
+test('offboarding: job detail carries the tenant, the retention policy and the HOLD IDS a console needs', async () => {
+  const g = await app.inject({ method: 'GET', url: `/admin/offboarding/${obJobId}`, headers: adminHdr });
+  eq(g.statusCode, 200, 'detail status');
+  eq(g.json().tenant_slug, 'tenant-three', 'tenant slug'); eq(g.json().tenant_status, 'deleted', 'tenant status after tombstone');
+  eq(g.json().retention_policy.policy_key, 'offboarding-default', 'policy joined');
+  // Releasing a hold needs its id; before this it was only ever returned once, at placement time.
+  const holds = g.json().legal_holds || [];
+  if (!holds.length) throw new Error('the placed+released hold is missing from the detail');
+  eq(holds[0].status, 'released', 'the demo hold was released'); if (!holds[0].id) throw new Error('hold id missing');
 });
 
 test('offboarding: blast radius is one tenant — tenant-one is unaffected', async () => {
@@ -380,6 +426,17 @@ test('support: the tenant audit chain records the flow and verifies intact', asy
   if (!tail.json().events.some((e) => e.outcome === 'denied')) throw new Error('prohibited denial not audited');
 });
 
+test('support: the session LIST surfaces the live impersonation so it survives a console reload', async () => {
+  const ctx = await app.inject({ method: 'GET', url: '/support/session', headers: bearer(supTok) });
+  const ssid = ctx.json().support_session_id;
+  const l = await app.inject({ method: 'GET', url: '/admin/support/sessions?status=active', headers: bearer(supTokB) });
+  eq(l.statusCode, 200, 'sessions status');
+  const row = (l.json().sessions || []).find((s) => s.id === ssid);
+  if (!row) throw new Error('the active support session is missing from the list');
+  eq(row.tenant_slug, 'tenant-one', 'tenant joined'); eq(row.mode, 'read_only', 'MVP mode');
+  eq(row.banner_required, true, 'C5 banner signal'); eq(row.past_ttl, false, 'still inside its TTL');
+});
+
 test('support: ending the impersonation session revokes the underlying session', async () => {
   const tail = await app.inject({ method: 'GET', url: '/admin/audit/tail?chain=tenant-one', headers: adminHdr });
   // find the active support session via a fresh impersonation is overkill; end via the operator surface using the session id from context
@@ -387,6 +444,29 @@ test('support: ending the impersonation session revokes the underlying session',
   const ssid = ctx.json().support_session_id;
   const e = await app.inject({ method: 'POST', url: `/admin/support/session/${ssid}/end`, headers: adminHdr });
   eq(e.statusCode, 200, 'end session'); if (!(Number(e.json().revoked) >= 1)) throw new Error('expected the underlying session revoked');
+});
+
+test('support: the request LIST carries BOTH sides of dual control (requester and approver)', async () => {
+  const l = await app.inject({ method: 'GET', url: '/admin/support/requests?tenant=tenant-one', headers: bearer(supTokA) });
+  eq(l.statusCode, 200, 'requests status');
+  const rows = l.json().requests || [];
+  if (!rows.length) throw new Error('no support requests listed');
+  for (const r of rows) eq(r.requested_by_email, 'support1@platform.example', 'requester identity joined');
+  const approved = rows.filter((r) => r.approved_by);
+  if (!approved.length) throw new Error('no approved request listed');
+  eq(approved[0].approved_by_email, 'support2@platform.example', 'approver identity joined');
+  if (approved[0].approved_by === approved[0].requested_by) throw new Error('dual control violated in the projection');
+});
+
+test('support: creating a request reports whether target_email actually resolved to a user', async () => {
+  const ok = await sreq({ tenant: 'tenant-one', target_email: 'u3@example.com', reason: 'resolvable' });
+  eq(ok.json().target_resolved, true, 'known email resolves');
+  const miss = await sreq({ tenant: 'tenant-one', target_email: 'ghost@example.com', reason: 'unresolvable' });
+  eq(miss.statusCode, 200, 'request still created'); eq(miss.json().target_resolved, false, 'unknown email flagged at create time');
+  // ...and that unresolved request is exactly the one impersonation would refuse three steps later.
+  const id = miss.json().support_access_request_id;
+  eq((await app.inject({ method: 'POST', url: `/admin/support/request/${id}/approve`, headers: bearer(supTokB) })).statusCode, 200, 'approved');
+  eq((await app.inject({ method: 'POST', url: '/admin/support/impersonate', headers: bearer(supTokB), payload: { request_id: id } })).statusCode, 400, 'no target to impersonate');
 });
 
 test('support: read_write impersonation is rejected in MVP (mode never diverges from enforcement)', async () => {

@@ -2,8 +2,8 @@
 
 The **operator console** for the MultiTenant platform — a Next.js (App Router) app deployed on Vercel
 (DEC-013). It drives the operator authentication ladder (password → TOTP MFA + step-up → SSO → WebAuthn
-passkeys) and the operator surfaces (audit chain, passkey management, and — via the same proxy — support
-and offboarding), talking to the Fastify **Hub** API.
+passkeys) and the operator surfaces — support access & impersonation, tenant offboarding, the Tier-A
+audit chain, and passkey management — talking to the Fastify **Hub** API.
 
 ## Architecture — BFF (backend-for-frontend)
 The browser never sees the operator token. It talks only to this app's Route Handlers under `app/api/*`,
@@ -16,7 +16,22 @@ browser ──(httpOnly cookie)──▶ Next.js route handlers ──(Bearer op
 
 - `app/api/login` · `mfa/verify` · `sso` · `webauthn/*` — auth ceremonies (set the session cookie)
 - `app/api/hub/[...path]` — a guarded proxy for `/admin/*` and `/operator/*` reads + actions
+- `app/api/support/*` — the impersonation surface. The Hub's **support token** is a bearer credential
+  for the impersonated tenant user, so it gets the same treatment as the operator token: its own
+  httpOnly cookie (`sup_token`), attached server-side, never returned to the browser
 - WebAuthn client (`lib/webauthn-client.ts`) uses the real `navigator.credentials` API
+
+## Pages
+| Page | Gate | What it drives |
+|---|---|---|
+| `/login` | — | password → TOTP step-up → passkey → SSO |
+| `/` | any operator | identity + `acr`/`amr` assurance badges |
+| `/support` | `support`\|`ops`\|`admin` | FOUNDATION_09 §12: open an access request, **dual-control approval** (the Approve button is withheld on your own requests — the Hub derives the approver from the approving operator's live session and would refuse it), impersonate → mandatory banner, probe the five prohibited action classes, end a session |
+| `/offboarding` | `ops`\|`admin` **+ step-up (`acr=mfa`)** | FOUNDATION_08: start a job, the 11-phase timeline with only the valid next edge offered, live gate status (export receipt · legal hold · retention clock · cache/search receipts · completion), legal-hold place/release, data-plane purge. Destructive steps (purge · tombstone · abort) stay disabled until you type the tenant slug |
+| `/audit` | `support`\|`ops`\|`admin` | Tier-A hash-chain verify + tail |
+| `/passkeys` | any operator | register / list / revoke WebAuthn credentials |
+
+> `/offboarding` **deletes tenants**. The seed ships a throwaway `tenant-three` for the demo.
 
 ## Run it locally
 Start the Hub first (from the repo root), pointing WebAuthn at this console's origin:

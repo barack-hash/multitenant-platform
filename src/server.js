@@ -473,6 +473,61 @@ export function buildServer() {
   };
   const relay = () => withServiceContext('svc_events', (c) => c.query('select app.relay_outbox(100)'));
 
+  // ---- console read surface: lists (the create/start endpoints hand back one id; an operator console
+  // has to ENUMERATE work). Service-only reads, gated by the SAME role/step-up matrix as the actions
+  // they feed, so a list can never leak what its action surface would refuse.
+  const capLimit = (v, d = 25, max = 200) => {
+    const n = Number.parseInt(v, 10);
+    return Number.isFinite(n) && n > 0 ? Math.min(n, max) : d;
+  };
+
+  // The lifecycle work queue: every job newest-first with its live gate status.
+  app.get('/admin/offboarding', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['ops', 'admin'])) return;
+    if (!await requireMfa(req, reply)) return;
+    const q = req.query || {};
+    const jobs = await withServiceContext('svc_ops', (c) => c.query(
+      `select j.id, j.tenant_id, t.slug tenant_slug, t.status tenant_status, j.phase, j.reason,
+              j.requested_at, j.approved_at, j.scheduled_purge_after, j.completed_at,
+              j.failed_at, j.failure_reason, j.updated_at,
+              rq.email requested_by_email, ap.email approved_by_email,
+              rp.policy_key retention_policy_key, rp.retention_days,
+              app.tenant_has_active_legal_hold(j.tenant_id) legal_hold_active,
+              app.offboarding_completion_ready(j.id) completion_ready
+         from tenant_offboarding_jobs j
+         left join tenants t on t.id = j.tenant_id
+         left join retention_policies rp on rp.id = j.retention_policy_id
+         left join platform_operators rq on rq.id = j.requested_by
+         left join platform_operators ap on ap.id = j.approved_by
+        where ($1::text is null or j.phase = $1) and ($2::text is null or t.slug = $2)
+        order by j.requested_at desc limit $3`,
+      [q.phase || null, q.tenant || null, capLimit(q.limit)])).then((r) => r.rows);
+    return { jobs };
+  });
+
+  // Tenant picker for both operator panels: slug/status plus whether lifecycle work is already open.
+  app.get('/admin/tenants', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['support', 'ops', 'admin'])) return;
+    const tenants = await withServiceContext('svc_ops', (c) => c.query(
+      `select t.id, t.slug, t.name, t.status, t.deleted_at,
+              (select j.id from tenant_offboarding_jobs j
+                where j.tenant_id = t.id and j.phase not in ('tombstoned','failed') limit 1) live_offboarding_job_id,
+              exists (select 1 from legal_holds h where h.tenant_id = t.id and h.status = 'active') legal_hold_active
+         from tenants t order by t.slug limit $1`,
+      [capLimit(req.query?.limit, 100)])).then((r) => r.rows);
+    return { tenants };
+  });
+
+  // The retention catalog (§15). Class C global-ref, so this is role-gated but needs no step-up — the
+  // panel must be able to render the start form BEFORE the operator steps up.
+  app.get('/admin/retention-policies', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['ops', 'admin'])) return;
+    const policies = await withServiceContext('svc_lifecycle', (c) => c.query(
+      `select id, policy_key, retention_class, retention_days, purge_mode, legal_hold_blocks_purge, description
+         from retention_policies order by policy_key`)).then((r) => r.rows);
+    return { policies };
+  });
+
   // Start an offboarding job for a tenant (phase 'requested').
   app.post('/admin/offboarding/start', { preHandler: operatorAuth }, async (req, reply) => {
     if (!await requireRole(req, reply, ['ops', 'admin'])) return;
@@ -565,7 +620,17 @@ export function buildServer() {
       };
       const ready = (await c.query('select app.offboarding_completion_ready($1) r', [req.params.id])).rows[0].r;
       const hold = (await c.query('select app.tenant_has_active_legal_hold($1) h', [job.tenant_id])).rows[0].h;
-      return { job, receipts, completion_ready: ready, legal_hold_active: hold };
+      const tenant = (await c.query('select slug, status, deleted_at from tenants where id=$1', [job.tenant_id])).rows[0] || null;
+      const policy = job.retention_policy_id
+        ? (await c.query('select policy_key, retention_class, retention_days from retention_policies where id=$1', [job.retention_policy_id])).rows[0] || null
+        : null;
+      // Releasing a hold needs its id, which was previously only returned once (at placement time).
+      const holds = (await c.query(
+        'select id, reason, reference, status, placed_at, released_at from legal_holds where tenant_id=$1 order by placed_at desc',
+        [job.tenant_id])).rows;
+      return { job, receipts, completion_ready: ready, legal_hold_active: hold,
+               tenant_slug: tenant?.slug ?? null, tenant_status: tenant?.status ?? null,
+               retention_policy: policy, legal_holds: holds };
     });
     if (!out) return reply.code(404).send({ error: 'OFFBOARDING_JOB_NOT_FOUND' });
     return out;
@@ -901,6 +966,54 @@ export function buildServer() {
     } catch (e) { return reply.code(400).send({ error: /foreign key/.test(e.message) ? 'operator not found' : 'issue_failed' }); }
   });
 
+  // The support work queue. Carries BOTH sides of the dual-control pair (requester + approver identity)
+  // so the console can show — and pre-empt — the "you cannot approve your own request" rule instead of
+  // discovering it as a 409. Same role gate as the actions it feeds; no step-up (§12 support ops are
+  // password-only by design).
+  app.get('/admin/support/requests', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['support', 'ops', 'admin'])) return;
+    const q = req.query || {};
+    const requests = await withServiceContext('svc_ops', (c) => c.query(
+      `select r.id, r.tenant_id, t.slug tenant_slug, r.status, r.mode, r.reason, r.ticket_ref,
+              r.ttl_seconds, r.requested_at, r.approved_at, r.denied_at, r.deny_reason, r.consumed_at,
+              r.approval_expires_at,
+              r.requested_by, rq.email requested_by_email, rq.display_name requested_by_name,
+              r.approved_by, ap.email approved_by_email,
+              r.target_user_id, u.primary_email target_email, u.display_name target_name,
+              (select s.id from support_sessions s
+                where s.access_request_id = r.id and s.status = 'active' limit 1) active_support_session_id
+         from support_access_requests r
+         left join tenants t on t.id = r.tenant_id
+         left join platform_operators rq on rq.id = r.requested_by
+         left join platform_operators ap on ap.id = r.approved_by
+         left join user_identities u on u.id = r.target_user_id
+        where ($1::text is null or r.status = $1) and ($2::text is null or t.slug = $2)
+        order by r.requested_at desc limit $3`,
+      [q.status || null, q.tenant || null, capLimit(q.limit)])).then((r) => r.rows);
+    return { requests };
+  });
+
+  // Live/recent impersonation sessions, so one can still be ENDED after the console reloads (the id is
+  // otherwise only returned once, at impersonate time). `past_ttl` flags an 'active' row whose window
+  // has already closed — it is dead to the token guard and will be swept (C4), never renewed.
+  app.get('/admin/support/sessions', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['support', 'ops', 'admin'])) return;
+    const q = req.query || {};
+    const sessions = await withServiceContext('svc_ops', (c) => c.query(
+      `select s.id, s.access_request_id, s.tenant_id, t.slug tenant_slug, s.support_operator_id,
+              o.email operator_email, s.target_user_id, u.primary_email target_email,
+              s.mode, s.banner_required, s.status, s.started_at, s.expires_at, s.ended_at, s.revoke_reason,
+              (s.status = 'active' and s.expires_at <= now()) past_ttl
+         from support_sessions s
+         left join tenants t on t.id = s.tenant_id
+         left join platform_operators o on o.id = s.support_operator_id
+         left join user_identities u on u.id = s.target_user_id
+        where ($1::text is null or s.status = $1)
+        order by s.started_at desc limit $2`,
+      [q.status || null, capLimit(q.limit)])).then((r) => r.rows);
+    return { sessions };
+  });
+
   // Open a support access request for a tenant. The requester IS the authenticated operator (from the
   // token) — not a body field — so dual-control can't be gamed by naming someone else as requester.
   app.post('/admin/support/request', { preHandler: operatorAuth }, async (req, reply) => {
@@ -930,7 +1043,10 @@ export function buildServer() {
     } catch (e) { return reply.code(400).send({ error: /check constraint|invalid input|violates/.test(e.message) ? 'invalid_request' : String(e.message).slice(0, 120) }); }
     await auditAppend('svc_support', { chain_id: resolved.tenantId, tenant: resolved.tenantId, action: 'support.request.created',
       actor_ref: requested_by, resource_type: 'support_access_request', resource_ref: id, meta: { mode, ttl_seconds } });
-    return { support_access_request_id: id, tenant_id: resolved.tenantId, status: 'pending' };
+    // A target_email that resolves to nobody yields a request that can never be impersonated (the
+    // impersonate call 400s on a null target) — surface that at CREATE time, not three steps later.
+    return { support_access_request_id: id, tenant_id: resolved.tenantId, status: 'pending',
+             target_resolved: Boolean(resolved.target) };
   });
 
   // Approve a request — TRUE dual-control: the approver is derived from the AUTHENTICATED operator's live

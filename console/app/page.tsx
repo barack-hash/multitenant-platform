@@ -36,12 +36,17 @@ export default async function Dashboard() {
       <div className="card">
         <h2>Operator surfaces</h2>
         <div className="row">
+          <Link href="/support">→ Support access &amp; impersonation</Link>
+          <Link href="/offboarding">→ Tenant offboarding</Link>
+        </div>
+        <div className="row">
           <Link href="/audit">→ Audit chain viewer</Link>
           <Link href="/passkeys">→ Manage passkeys</Link>
         </div>
         <p className="hint">
-          Support/impersonation and tenant-offboarding panels use the same authenticated BFF proxy
-          (<code>/api/hub/admin/*</code>) — extend under <code>app/</code>.
+          Support (dual-control impersonation) is open to <code>support</code>, <code>ops</code> and{' '}
+          <code>admin</code> at any assurance. Tenant offboarding is <code>ops</code>/<code>admin</code>{' '}
+          <strong>and</strong> requires step-up — it deletes tenants.
         </p>
       </div>
     </>
