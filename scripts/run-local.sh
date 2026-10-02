@@ -25,7 +25,9 @@ echo "== start (port $PORT) =="
 
 echo "== reset =="
 "$PGBIN/psql" "$DATABASE_URL" -q -c "drop schema if exists app cascade;
-  drop table if exists operator_webauthn_challenges, operator_webauthn_credentials,
+  drop table if exists feature_flag_decision_log, feature_flag_audit_events, feature_flag_rollouts,
+    feature_flag_environments, feature_flag_definitions,
+    operator_webauthn_challenges, operator_webauthn_credentials,
     operator_federated_identities, operator_idp, operator_recovery_codes, operator_mfa,
     operator_sessions, operator_credentials,
     audit_anchor_points, audit_events, support_sessions, support_access_requests,
@@ -89,6 +91,9 @@ node test/mfa.test.mjs || RC=1
 echo ""
 echo "== DB isolation gate (group 13 · WebAuthn / passkeys) =="
 node test/webauthn.test.mjs || RC=1
+echo ""
+echo "== DB isolation gate (group 14 · feature-flag governance) =="
+node test/flags.test.mjs || RC=1
 echo ""
 echo "== API gate =="
 node test/api.test.mjs || RC=1

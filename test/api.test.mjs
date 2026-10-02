@@ -611,6 +611,102 @@ test('passkey: a regressed sign counter is treated as a cloned authenticator', a
   eq((await app.inject({ method: 'POST', url: '/operator/webauthn/login/finish', payload: { challenge_id: lb.challenge_id, ...asr } })).json().error, 'WEBAUTHN_CLONE_DETECTED', 'sign-count regression → clone detected');
 });
 
+// ---- group 14: feature-flag governance (MASTER_PLAN §11) ----
+const myFlags = async (email, tenant, appKey) => {
+  const tok = (await login(email, tenant)).json().token;
+  return app.inject({ method: 'GET', url: `/my-flags${appKey ? `?app=${appKey}` : ''}`, headers: bearer(tok) });
+};
+const flagPost = (tok, url, payload) => app.inject({ method: 'POST', url, headers: bearer(tok), payload });
+const QA = 'qa.api_checkout';
+let qaRule;
+
+test('flags: /my-flags resolves for the CALLER’s tenant and returns values only — no rules, targets or ids', async () => {
+  const a = await myFlags('u1@example.com', 'tenant-one');
+  eq(a.statusCode, 200, 'tenant-one /my-flags'); eq(a.json().flags['hifz.progress_v2'], true, 'seeded tenant rule applies to tenant-one');
+  eq(a.json().environment, 'dev', 'served environment');
+  const b = await myFlags('u2@example.com', 'tenant-two');
+  eq(b.json().flags['hifz.progress_v2'], false, 'tenant-two gets the environment default');
+  const raw = a.body;
+  for (const leak of ['target_ref', 'rule_id', 'tier', '11111111-1111', 'priority']) if (raw.includes(leak)) throw new Error(`tenant payload leaks "${leak}"`);
+  eq((await app.inject({ method: 'GET', url: '/my-flags' })).statusCode, 401, 'requires a tenant token');
+  // Each app key is a decision subject in a never-deleted log — junk keys must not mint new subjects.
+  const junk = await myFlags('u1@example.com', 'tenant-one', 'junk-app-123');
+  eq(junk.statusCode, 400, 'unknown app refused'); eq(junk.json().error, 'UNKNOWN_APP', 'code');
+});
+
+test('flags: support may read and explain, but not write; password-only ops is refused step-up', async () => {
+  const l = await app.inject({ method: 'GET', url: '/admin/flags', headers: bearer(supTokA) });
+  eq(l.statusCode, 200, 'support lists flags');
+  if (!l.json().flags.find((f) => f.flag_key === 'hifz.progress_v2' && f.environments.dev)) throw new Error('seeded flag missing from list');
+  const x = await app.inject({ method: 'GET', url: '/admin/flags/hifz.progress_v2/explain?tenant=tenant-one', headers: bearer(supTokA) });
+  eq(x.statusCode, 200, 'support explains'); eq(x.json().decision.tier, 'tenant', 'explained tier');
+  eq(x.json().candidates.filter((r) => r.selected).length, 1, 'exactly one rule marked selected');
+  const body = { flag_key: 'qa.denied', description: 'x', flag_type: 'boolean', owner_team: 'qa', risk_level: 'low', off_value: false };
+  const s = await flagPost(supTokA, '/admin/flags', body);
+  eq(s.statusCode, 403, 'support cannot write'); eq(s.json().error, 'OPERATOR_ROLE_REQUIRED', 'role code');
+  const p = await flagPost(await loginOp('ops2@platform.example', 'opk_op5_key_eeeeeeee'), '/admin/flags', body);
+  eq(p.statusCode, 403, 'pwd-only ops refused'); eq(p.json().error, 'MFA_REQUIRED', 'step-up code');
+});
+
+test('flags: create → tenant rule → /my-flags reflects it for that tenant only', async () => {
+  const c = await flagPost(opsTok, '/admin/flags', { flag_key: QA, description: 'API checkout experiment', flag_type: 'multivariate',
+    owner_team: 'qa', risk_level: 'medium', variants: ['control', 'wizard'], off_value: 'control' });
+  eq(c.statusCode, 200, 'MFA ops creates a flag');
+  eq((await myFlags('u1@example.com', 'tenant-one')).json().flags[QA], 'control', 'starts at off_value in every environment');
+  const r = await flagPost(opsTok, `/admin/flags/${QA}/rollouts`, { environment: 'dev', target_type: 'tenant', tenant: 'tenant-one', value: 'wizard' });
+  eq(r.statusCode, 200, 'tenant rule created'); qaRule = r.json().rule_id;
+  eq((await myFlags('u1@example.com', 'tenant-one')).json().flags[QA], 'wizard', 'tenant-one sees its override');
+  eq((await myFlags('u2@example.com', 'tenant-two')).json().flags[QA], 'control', 'tenant-two is unaffected');
+});
+
+test('flags: the kill switch overrides every rule for everyone (reason required); release restores', async () => {
+  eq((await flagPost(opsTok, `/admin/flags/${QA}/environments/dev/kill`, { engaged: true })).statusCode, 400, 'no reason → 400');
+  eq((await flagPost(opsTok, `/admin/flags/${QA}/environments/dev/kill`, { engaged: true, reason: 'checkout incident' })).statusCode, 200, 'engage');
+  eq((await myFlags('u1@example.com', 'tenant-one')).json().flags[QA], 'control', 'tenant rule overridden by the kill switch');
+  const x = await app.inject({ method: 'GET', url: `/admin/flags/${QA}/explain?tenant=tenant-one`, headers: bearer(opsTok) });
+  eq(x.json().decision.tier, 'kill_switch', 'explain names tier 1');
+  eq((await flagPost(opsTok, `/admin/flags/${QA}/environments/dev/kill`, { engaged: false })).statusCode, 200, 'release');
+  eq((await myFlags('u1@example.com', 'tenant-one')).json().flags[QA], 'wizard', 'rule applies again');
+});
+
+test('flags: bad input surfaces as typed errors, not 500s', async () => {
+  const rule = (b) => flagPost(opsTok, `/admin/flags/${QA}/rollouts`, { environment: 'dev', ...b });
+  eq((await rule({ target_type: 'tenant', tenant: 'tenant-two', value: 'nope' })).json().error, 'FLAG_VALUE_INVALID', 'undeclared variant');
+  eq((await rule({ target_type: 'tenant', tenant: 'no-such-tenant', value: 'wizard' })).statusCode, 404, 'unknown tenant slug');
+  eq((await rule({ target_type: 'cohort', percent: 101, value: 'wizard' })).json().error, 'FLAG_TARGET_INVALID', 'cohort > 100');
+  eq((await rule({ target_type: 'app', app: 'no-such-app', value: 'wizard' })).json().error, 'FLAG_TARGET_INVALID', 'unknown app');
+  eq((await flagPost(opsTok, '/admin/flags', { flag_key: QA, description: 'dup', flag_type: 'boolean', owner_team: 'qa', risk_level: 'low', off_value: false })).json().error, 'FLAG_EXISTS', 'duplicate key');
+  eq((await flagPost(opsTok, '/admin/flags/qa.nope/rollouts', { environment: 'dev', target_type: 'app', app: 'hifz-lms', value: true })).statusCode, 404, 'unknown flag');
+});
+
+test('flags: rules end but never revive; every change is attributed in the flag history and the platform chain', async () => {
+  eq((await flagPost(opsTok, `/admin/flags/${QA}/rollouts/${qaRule}/status`, { status: 'ended' })).statusCode, 200, 'end rule');
+  eq((await myFlags('u1@example.com', 'tenant-one')).json().flags[QA], 'control', 'back to the default');
+  const rv = await flagPost(opsTok, `/admin/flags/${QA}/rollouts/${qaRule}/status`, { status: 'active' });
+  eq(rv.statusCode, 409, 'revive refused'); eq(rv.json().error, 'FLAG_RULE_TERMINAL', 'code');
+  const d = (await app.inject({ method: 'GET', url: `/admin/flags/${QA}`, headers: bearer(opsTok) })).json();
+  const actions = d.audit.map((a) => a.action);
+  for (const a of ['flag.created', 'rule.created', 'kill_switch.engaged', 'kill_switch.released', 'rule.status.ended'])
+    if (!actions.includes(a)) throw new Error(`flag history missing ${a}`);
+  if (!d.audit.every((a) => a.actor_email === 'ops1@platform.example')) throw new Error('an audit row is not attributed to ops1');
+  const tiers = d.decisions.filter((x) => x.tenant_slug === 'tenant-one').map((x) => x.tier);
+  for (const t of ['tenant', 'kill_switch', 'default']) if (!tiers.includes(t)) throw new Error(`decision log missing tier ${t}`);
+  const tail = (await app.inject({ method: 'GET', url: '/admin/audit/tail?chain=platform', headers: bearer(opsTok) })).json().events.map((e) => e.action);
+  if (!tail.includes('flag.kill_switch')) throw new Error('kill switch not on the Tier-A platform chain');
+});
+
+test('flags: paused serves off_value; archived disappears from tenants and cannot be revived', async () => {
+  await flagPost(opsTok, `/admin/flags/${QA}/rollouts`, { environment: 'dev', target_type: 'tenant', tenant: 'tenant-one', value: 'wizard' });
+  eq((await myFlags('u1@example.com', 'tenant-one')).json().flags[QA], 'wizard', 'new rule live');
+  eq((await flagPost(opsTok, `/admin/flags/${QA}/status`, { status: 'paused' })).statusCode, 200, 'pause');
+  eq((await myFlags('u1@example.com', 'tenant-one')).json().flags[QA], 'control', 'paused → off_value');
+  await flagPost(opsTok, `/admin/flags/${QA}/status`, { status: 'archived' });
+  if (QA in (await myFlags('u1@example.com', 'tenant-one')).json().flags) throw new Error('archived flag still served');
+  eq((await flagPost(opsTok, `/admin/flags/${QA}/status`, { status: 'active' })).json().error, 'FLAG_ARCHIVED', 'archive is terminal');
+  eq((await flagPost(opsTok, `/admin/flags/${QA}/rollouts`, { environment: 'dev', target_type: 'app', app: 'hifz-lms', value: 'wizard' })).json().error,
+    'FLAG_ARCHIVED', 'no new rules on an archived flag');
+});
+
 let pass = 0, fail = 0;
 for (const t of tests) {
   try { await t.fn(); console.log(`  \x1b[32mPASS\x1b[0m  ${t.name}`); pass++; }

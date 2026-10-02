@@ -2,7 +2,7 @@
 
 The **operator console** for the MultiTenant platform — a Next.js (App Router) app deployed on Vercel
 (DEC-013). It drives the operator authentication ladder (password → TOTP MFA + step-up → SSO → WebAuthn
-passkeys) and the operator surfaces — support access & impersonation, tenant offboarding, the Tier-A
+passkeys) and the operator surfaces — support access & impersonation, tenant offboarding, feature flags, the Tier-A
 audit chain, and passkey management — talking to the Fastify **Hub** API.
 
 ## Architecture — BFF (backend-for-frontend)
@@ -28,6 +28,7 @@ browser ──(httpOnly cookie)──▶ Next.js route handlers ──(Bearer op
 | `/` | any operator | identity + `acr`/`amr` assurance badges |
 | `/support` | `support`\|`ops`\|`admin` | FOUNDATION_09 §12: open an access request, **dual-control approval** (the Approve button is withheld on your own requests — the Hub derives the approver from the approving operator's live session and would refuse it), impersonate → mandatory banner, probe the five prohibited action classes, end a session |
 | `/offboarding` | `ops`\|`admin` **+ step-up (`acr=mfa`)** | FOUNDATION_08: start a job, the 11-phase timeline with only the valid next edge offered, live gate status (export receipt · legal hold · retention clock · cache/search receipts · completion), legal-hold place/release, data-plane purge. Destructive steps (purge · tombstone · abort) stay disabled until you type the tenant slug |
+| `/flags` | read + explain: `support`\|`ops`\|`admin`; writes: `ops`\|`admin` **+ step-up** | MASTER_PLAN §11: per-environment defaults and kill switch (who/why/when), rules by tier, an **explain** dry run showing which rule won and why every other one lost, change history and decisions served |
 | `/audit` | `support`\|`ops`\|`admin` | Tier-A hash-chain verify + tail |
 | `/passkeys` | any operator | register / list / revoke WebAuthn credentials |
 

@@ -1238,6 +1238,245 @@ export function buildServer() {
     }
   });
 
+  // ---- group 14: feature-flag governance (MASTER_PLAN §11, FOUNDATION_13) ----
+  // Config is owned by svc_ops; every write sets app.flag_actor so the DB trigger can attribute it (an
+  // unattributed change is refused). The tenant read path runs as svc_hub and returns RESOLVED VALUES
+  // only — never rules, targets or other tenants' overrides (DEC-010; no tenant flag projection exists).
+  const FLAG_ENVS = ['dev', 'staging', 'prod'];
+  const flagError = (e) => {
+    const m = String(e.message || '');
+    const table = [
+      [/FLAG_NOT_FOUND/, 404, 'FLAG_NOT_FOUND'], [/FLAG_VALUE_INVALID|ck_ff_off_value/, 400, 'FLAG_VALUE_INVALID'],
+      [/FLAG_TARGET_INVALID/, 400, 'FLAG_TARGET_INVALID'], [/FLAG_BAD_ENVIRONMENT/, 400, 'FLAG_BAD_ENVIRONMENT'],
+      [/FLAG_RULE_IMMUTABLE/, 409, 'FLAG_RULE_IMMUTABLE'], [/FLAG_RULE_TERMINAL/, 409, 'FLAG_RULE_TERMINAL'],
+      [/FLAG_IMMUTABLE_FIELD/, 409, 'FLAG_IMMUTABLE_FIELD'], [/FLAG_ARCHIVED/, 409, 'FLAG_ARCHIVED'],
+      [/ck_ff_variants/, 400, 'FLAG_VARIANTS_INVALID'], [/ck_ff_window/, 400, 'FLAG_WINDOW_INVALID'],
+      [/duplicate key/, 409, 'FLAG_EXISTS'], [/check constraint|invalid input syntax|out of range/, 400, 'FLAG_INVALID'],
+    ];
+    for (const [rx, code, error] of table) if (rx.test(m)) return { code, error, detail: m.split('\n')[0].slice(0, 160) };
+    return null;
+  };
+  const flagWrite = (req, fn) => withServiceContext('svc_ops', async (c) => {
+    await c.query("select set_config('app.flag_actor',$1,true)", [req.operator.id]);
+    return fn(c);
+  });
+  const flagAudit = (req, action, meta) => auditAppend('svc_ops', { chain_id: 'platform', action, actor_ref: req.operator.id,
+    resource_type: 'feature_flag', resource_ref: meta.flag_key, meta });
+  const flagIdOf = async (c, key) => (await c.query('select id from feature_flag_definitions where flag_key=$1', [key])).rows[0]?.id;
+  const tenantIdOf = async (slug) => (await withServiceContext('svc_ops', (c) =>
+    c.query('select id from tenants where slug=$1 and deleted_at is null', [slug]))).rows[0]?.id;
+  // Run a flag write: role + step-up gate, error mapping, and a platform-chain audit entry on success.
+  const flagMutation = async (req, reply, action, fn) => {
+    if (!await requireRole(req, reply, ['ops', 'admin'])) return;
+    if (!await requireMfa(req, reply)) return;
+    try {
+      const out = await fn();
+      if (out?.__status) return reply.code(out.__status).send({ error: out.error });
+      await flagAudit(req, action, { flag_key: req.params.key || out?.flag_key, environment: out?.environment ?? null });
+      return out;
+    } catch (e) {
+      const fe = flagError(e); if (fe) return reply.code(fe.code).send({ error: fe.error, detail: fe.detail });
+      throw e;
+    }
+  };
+  const isJsonValue = (v) => v !== undefined;
+
+  // Tenant read path: every non-archived flag resolved for the CALLER'S tenant (from the verified token,
+  // never a parameter), in this Hub's environment, optionally for one app. Each distinct decision is
+  // logged by app.evaluate_flag (§11).
+  app.get('/my-flags', { preHandler: auth }, async (req, reply) => {
+    const appKey = typeof req.query?.app === 'string' && req.query.app ? req.query.app : null;
+    const flags = await withServiceContext('svc_hub', async (c) => {
+      // Only catalog apps: every distinct app key is a new decision subject in a never-deleted log, so an
+      // unvalidated key would let any tenant user grow that log without bound.
+      if (appKey && !(await c.query('select 1 from apps where app_key=$1', [appKey])).rowCount) return null;
+      const keys = (await c.query("select flag_key from feature_flag_definitions where status <> 'archived' order by flag_key")).rows;
+      const out = {};
+      for (const { flag_key } of keys) {
+        out[flag_key] = (await c.query('select value from app.evaluate_flag($1,$2,$3,$4,true)',
+          [flag_key, cfg.platformEnv, req.claims.tid, appKey])).rows[0].value;
+      }
+      return out;
+    });
+    if (!flags) return reply.code(400).send({ error: 'UNKNOWN_APP', app: appKey });
+    return { environment: cfg.platformEnv, app: appKey, flags };
+  });
+
+  // Operator reads (support|ops|admin — support needs "why does tenant X see Y"; no step-up).
+  app.get('/admin/flags', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['support', 'ops', 'admin'])) return;
+    const flags = await withServiceContext('svc_ops', (c) => c.query(
+      `select d.id, d.flag_key, d.description, d.flag_type, d.owner_team, d.risk_level, d.status, d.variants, d.off_value,
+              coalesce((select jsonb_object_agg(e.environment, jsonb_build_object(
+                  'default_value', e.default_value, 'kill_engaged', e.kill_engaged, 'kill_reason', e.kill_reason))
+                from feature_flag_environments e where e.flag_id = d.id), '{}'::jsonb) environments,
+              (select count(*) from feature_flag_rollouts r where r.flag_id = d.id and r.status = 'active')::int active_rules
+         from feature_flag_definitions d order by d.flag_key`)).then((r) => r.rows);
+    return { environment: cfg.platformEnv, flags };
+  });
+
+  app.get('/admin/flags/:key', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['support', 'ops', 'admin'])) return;
+    const out = await withServiceContext('svc_ops', async (c) => {
+      const flag = (await c.query('select * from feature_flag_definitions where flag_key=$1', [req.params.key])).rows[0];
+      if (!flag) return null;
+      const environments = (await c.query(
+        `select e.*, o.email killed_by_email from feature_flag_environments e
+           left join platform_operators o on o.id = e.killed_by
+          where e.flag_id=$1 order by array_position(array['dev','staging','prod'], e.environment)`, [flag.id])).rows;
+      const rollouts = (await c.query(
+        `select r.*, t.slug tenant_slug, o.email created_by_email,
+                (r.status = 'active' and (r.start_at is null or r.start_at <= now()) and (r.end_at is null or now() < r.end_at)) live
+           from feature_flag_rollouts r
+           left join tenants t on r.target_type in ('tenant','tenant_app') and t.id::text = split_part(r.target_ref, ':', 1)
+           left join platform_operators o on o.id = r.created_by
+          where r.flag_id=$1
+          order by r.environment, case r.target_type when 'tenant_app' then 2 when 'tenant' then 3 when 'app' then 4 else 5 end,
+                   r.priority, r.created_at desc`, [flag.id])).rows;
+      const audit = (await c.query(
+        `select a.action, a.environment, a.occurred_at, a.actor_id, o.email actor_email, a.after_value
+           from feature_flag_audit_events a left join platform_operators o on o.id = a.actor_id
+          where a.flag_id=$1 order by a.occurred_at desc, a.id desc limit 30`, [flag.id])).rows;
+      const decisions = (await c.query(
+        `select l.seq, l.environment, t.slug tenant_slug, l.app_key, l.value, l.tier, l.rule_id, l.reason, l.decided_at
+           from feature_flag_decision_log l left join tenants t on t.id = l.tenant_id
+          where l.flag_id=$1 order by l.seq desc limit 30`, [flag.id])).rows;
+      return { flag, environments, rollouts, audit, decisions };
+    });
+    if (!out) return reply.code(404).send({ error: 'FLAG_NOT_FOUND' });
+    return out;
+  });
+
+  // Explain (dry run): the decision for one subject plus EVERY rule with why it won or lost. Shares
+  // app.flag_candidates with the resolver, so the explanation cannot disagree with what is served.
+  // Never logged as a decision — nothing was served.
+  app.get('/admin/flags/:key/explain', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['support', 'ops', 'admin'])) return;
+    const { environment = cfg.platformEnv, tenant, app: appKey = null } = req.query || {};
+    if (!tenant) return reply.code(400).send({ error: 'tenant (slug) is required' });
+    const tid = await tenantIdOf(tenant);
+    if (!tid) return reply.code(404).send({ error: 'tenant not found' });
+    try {
+      return await withServiceContext('svc_ops', async (c) => {
+        const decision = (await c.query('select * from app.evaluate_flag($1,$2,$3,$4,false)',
+          [req.params.key, environment, tid, appKey || null])).rows[0];
+        const fid = await flagIdOf(c, req.params.key);
+        const candidates = (await c.query('select * from app.flag_candidates($1,$2,$3,$4)', [fid, environment, tid, appKey || null]))
+          .rows.map((r) => ({ ...r, selected: r.rule_id === decision.rule_id }));
+        return { flag_key: req.params.key, environment, tenant, app: appKey || null, decision, candidates };
+      });
+    } catch (e) {
+      const fe = flagError(e); if (fe) return reply.code(fe.code).send({ error: fe.error, detail: fe.detail });
+      throw e;
+    }
+  });
+
+  // ---- writes: ops|admin + step-up, each attributed in the DB and on the platform audit chain ----
+
+  app.post('/admin/flags', { preHandler: operatorAuth }, (req, reply) => flagMutation(req, reply, 'flag.created', async () => {
+    const { flag_key, description, flag_type, owner_team, risk_level, variants = null, off_value, default_value } = req.body || {};
+    if (!flag_key || !description || !flag_type || !owner_team || !risk_level || !isJsonValue(off_value))
+      return { __status: 400, error: 'flag_key, description, flag_type, owner_team, risk_level and off_value are required' };
+    return flagWrite(req, async (c) => {
+      const id = (await c.query(
+        `insert into feature_flag_definitions(flag_key, description, flag_type, owner_team, risk_level, variants, off_value)
+         values($1,$2,$3,$4,$5,$6,$7) returning id`,
+        [flag_key, description, flag_type, owner_team, risk_level, variants, JSON.stringify(off_value)])).rows[0].id;
+      // Every environment starts at the safe value unless told otherwise.
+      for (const env of FLAG_ENVS) await c.query(
+        'insert into feature_flag_environments(flag_id, environment, default_value, updated_by) values($1,$2,$3,$4)',
+        [id, env, JSON.stringify(isJsonValue(default_value) ? default_value : off_value), req.operator.id]);
+      return { flag_id: id, flag_key };
+    });
+  }));
+
+  app.post('/admin/flags/:key/status', { preHandler: operatorAuth }, (req, reply) => flagMutation(req, reply, 'flag.status_changed', async () => {
+    const { status } = req.body || {};
+    if (!['active', 'paused', 'archived'].includes(status)) return { __status: 400, error: 'status must be active|paused|archived' };
+    return flagWrite(req, async (c) => {
+      const n = await c.query(
+        `update feature_flag_definitions set status=$2, archived_at = case when $2 = 'archived' then coalesce(archived_at, now()) else null end
+          where flag_key=$1`, [req.params.key, status]);
+      return n.rowCount ? { flag_key: req.params.key, status } : { __status: 404, error: 'FLAG_NOT_FOUND' };
+    });
+  }));
+
+  app.post('/admin/flags/:key/environments/:env', { preHandler: operatorAuth }, (req, reply) => flagMutation(req, reply, 'flag.default_changed', async () => {
+    const { default_value } = req.body || {};
+    if (!FLAG_ENVS.includes(req.params.env)) return { __status: 400, error: 'FLAG_BAD_ENVIRONMENT' };
+    if (!isJsonValue(default_value)) return { __status: 400, error: 'default_value is required' };
+    return flagWrite(req, async (c) => {
+      const n = await c.query(
+        `update feature_flag_environments set default_value=$3, updated_by=$4, updated_at=now()
+          where flag_id=(select id from feature_flag_definitions where flag_key=$1) and environment=$2`,
+        [req.params.key, req.params.env, JSON.stringify(default_value), req.operator.id]);
+      return n.rowCount ? { flag_key: req.params.key, environment: req.params.env, default_value } : { __status: 404, error: 'FLAG_NOT_FOUND' };
+    });
+  }));
+
+  // §11 tier 1. Engaging requires a reason (recorded with who + when); it can only ever serve off_value.
+  app.post('/admin/flags/:key/environments/:env/kill', { preHandler: operatorAuth }, (req, reply) => flagMutation(req, reply, 'flag.kill_switch', async () => {
+    const { engaged, reason } = req.body || {};
+    if (!FLAG_ENVS.includes(req.params.env)) return { __status: 400, error: 'FLAG_BAD_ENVIRONMENT' };
+    if (typeof engaged !== 'boolean') return { __status: 400, error: 'engaged (boolean) is required' };
+    if (engaged && !reason) return { __status: 400, error: 'a reason is required to engage a kill switch' };
+    return flagWrite(req, async (c) => {
+      const n = await c.query(
+        `update feature_flag_environments
+            set kill_engaged=$3, kill_reason=case when $3 then $4 end, killed_by=case when $3 then $5::uuid end,
+                killed_at=case when $3 then now() end, updated_by=$5, updated_at=now()
+          where flag_id=(select id from feature_flag_definitions where flag_key=$1) and environment=$2`,
+        [req.params.key, req.params.env, engaged, reason || null, req.operator.id]);
+      return n.rowCount ? { flag_key: req.params.key, environment: req.params.env, kill_engaged: engaged } : { __status: 404, error: 'FLAG_NOT_FOUND' };
+    });
+  }));
+
+  // Add a rule. Targets are given in operator terms (tenant SLUG, app key, percent) and converted to the
+  // canonical target_ref here; the DB guard re-validates that the target exists.
+  app.post('/admin/flags/:key/rollouts', { preHandler: operatorAuth }, (req, reply) => flagMutation(req, reply, 'flag.rule_created', async () => {
+    const { environment, target_type, tenant, app: appKey, percent, value, priority = 100,
+            start_at = null, end_at = null, status = 'active' } = req.body || {};
+    if (!FLAG_ENVS.includes(environment)) return { __status: 400, error: 'FLAG_BAD_ENVIRONMENT' };
+    if (!isJsonValue(value)) return { __status: 400, error: 'value is required' };
+    if (!['active', 'scheduled', 'paused'].includes(status)) return { __status: 400, error: 'a new rule must be active|scheduled|paused' };
+    let ref;
+    if (target_type === 'tenant' || target_type === 'tenant_app') {
+      if (!tenant) return { __status: 400, error: 'tenant (slug) is required' };
+      const tid = await tenantIdOf(tenant);
+      if (!tid) return { __status: 404, error: 'tenant not found' };
+      if (target_type === 'tenant_app' && !appKey) return { __status: 400, error: 'app is required for a tenant_app rule' };
+      ref = target_type === 'tenant' ? tid : `${tid}:${appKey}`;
+    } else if (target_type === 'app') {
+      if (!appKey) return { __status: 400, error: 'app is required' };
+      ref = appKey;
+    } else if (target_type === 'cohort') {
+      if (!Number.isInteger(percent)) return { __status: 400, error: 'percent (integer 0-100) is required' };
+      ref = `pct:${percent}`;
+    } else return { __status: 400, error: 'target_type must be tenant_app|tenant|app|cohort' };
+    return flagWrite(req, async (c) => {
+      const fid = await flagIdOf(c, req.params.key);
+      if (!fid) return { __status: 404, error: 'FLAG_NOT_FOUND' };
+      const id = (await c.query(
+        `insert into feature_flag_rollouts(flag_id, environment, target_type, target_ref, value, priority, start_at, end_at, status, created_by)
+         values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning id`,
+        [fid, environment, target_type, ref, JSON.stringify(value), priority, start_at, end_at, status, req.operator.id])).rows[0].id;
+      return { rule_id: id, flag_key: req.params.key, environment, target_type, target_ref: ref };
+    });
+  }));
+
+  // Rules are append-mostly: the only change is status (ended is terminal — the DB refuses a revival).
+  app.post('/admin/flags/:key/rollouts/:id/status', { preHandler: operatorAuth }, (req, reply) => flagMutation(req, reply, 'flag.rule_status_changed', async () => {
+    const { status } = req.body || {};
+    if (!['active', 'scheduled', 'paused', 'ended'].includes(status)) return { __status: 400, error: 'status must be active|scheduled|paused|ended' };
+    return flagWrite(req, async (c) => {
+      const r = await c.query(
+        `update feature_flag_rollouts set status=$3
+          where id::text=$2 and flag_id=(select id from feature_flag_definitions where flag_key=$1) returning environment`,
+        [req.params.key, req.params.id, status]);
+      return r.rowCount ? { rule_id: req.params.id, status, environment: r.rows[0].environment } : { __status: 404, error: 'FLAG_RULE_NOT_FOUND' };
+    });
+  }));
+
   // Assign a role — RLS enforces the roles.assign permission AND tenant write-eligibility.
   app.post('/roles/assign', { preHandler: auth }, async (req, reply) => {
     const { membership_id, role_id } = req.body || {};

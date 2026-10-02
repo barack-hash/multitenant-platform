@@ -21,5 +21,7 @@ export const cfg = {
   webauthnOrigin: process.env.WEBAUTHN_ORIGIN || 'http://localhost:3939',
   adminToken: process.env.ADMIN_API_TOKEN || 'dev-admin-token',
   breakGlassEnabled: ['1', 'true', 'yes'].includes(String(process.env.BREAKGLASS_ENABLED || '').toLowerCase()),
+  // Group 14: which feature-flag environment this Hub serves (§11 tier 6 + every rule are per-environment).
+  platformEnv: ['dev', 'staging', 'prod'].includes(process.env.PLATFORM_ENV) ? process.env.PLATFORM_ENV : 'dev',
   port: Number(process.env.PORT || 3000),
 };

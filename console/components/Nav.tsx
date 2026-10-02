@@ -18,6 +18,7 @@ export default function Nav() {
         <Link href="/">Dashboard</Link>
         <Link href="/support">Support</Link>
         <Link href="/offboarding">Offboarding</Link>
+        <Link href="/flags">Flags</Link>
         <Link href="/audit">Audit</Link>
         <Link href="/passkeys">Passkeys</Link>
       </nav>
