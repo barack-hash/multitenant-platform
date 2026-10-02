@@ -4,8 +4,8 @@ A reusable, **business-agnostic multi-tenant SaaS platform** built as a modular 
 **tenant isolation is enforced in Postgres by Row-Level Security** — beneath the application — so a bug
 in a request handler still cannot cross a tenant boundary.
 
-Fourteen foundation groups plus a real Next.js operator console are built and proven end-to-end
-(database + HTTP + browser), with **195 automated checks** that run in one command against a disposable
+Fifteen foundation groups plus a real Next.js operator console are built and proven end-to-end
+(database + HTTP + browser), with **210 automated checks** that run in one command against a disposable
 local Postgres.
 
 ## Security model (the load-bearing idea)
@@ -24,7 +24,7 @@ claims. Policies fall into four canonical classes:
 A logical-vs-physical role split (a trusted `app.svc_role` GUC checked against `current_user='svc_worker'`)
 means a compromised `svc_app` path can never satisfy a service policy by spoofing context.
 
-## The fourteen foundation groups
+## The fifteen foundation groups
 
 | # | Group | What it proves |
 |---|-------|----------------|
@@ -42,6 +42,7 @@ means a compromised `svc_app` path can never satisfy a service policy by spoofin
 | 12 | Operator MFA + SSO | TOTP (pure-Node RFC 6238) + recovery codes + HMAC-signed IdP assertions; `acr=mfa` **step-up** gates the destructive surfaces |
 | 13 | WebAuthn / passkeys | real ES256 assertion verification (no deps): origin + RP-ID binding, user verification, sign-count clone detection |
 | 14 | Feature-flag governance | MASTER_PLAN §11 six-tier precedence (kill switch → tenant+app → tenant → app → cohort → default), deterministic resolution with an operator "explain", typed + attributed + append-only history, decision log |
+| 15 | Rate-limit enforcement | GCRA token buckets: per-IP login + webhook throttling, per-principal **and** per-tenant API limits (noisy-neighbour control with tenant overrides), fail-open with visibility; Postgres store locally, Upstash in production |
 
 The whole thing converges into one loop: **Stripe webhook → billing → entitlements → app lock/unlock →
 4-token spoke launch → revocation cascade**, on a transactional-outbox event backbone, with brokered
@@ -49,7 +50,7 @@ files, consent-gated minor data, a gated tenant-purge state machine, and an immu
 
 ## Layout
 ```
-db/migrations/  0000 roles … 0015 feature flags   (append-only, numbered)
+db/migrations/  0000 roles … 0016 rate-limit enforcement   (append-only, numbered)
 db/seed/        deterministic fixtures (tenants, users, RBAC, apps, plans, operators)
 src/            modular-monolith Hub runtime (Fastify): config · db · tokens · mfa · webauthn · server
 test/           isolation.mjs + one *.test.mjs per group + api.test.mjs (HTTP end-to-end)
@@ -61,7 +62,7 @@ scripts/run-local.sh   one-command reproduce (no Docker required)
 A Next.js (App Router) app — the operator-facing UI, deployed on Vercel (DEC-013). It drives the operator
 auth ladder (password → TOTP MFA + step-up → SSO → WebAuthn passkeys) and the operator surfaces:
 **support access & impersonation** (`/support`), **tenant offboarding** (`/offboarding`), **feature flags**
-(`/flags`), the Tier-A audit
+(`/flags`), **rate limits** (`/rate-limits`), the Tier-A audit
 chain (`/audit`) and passkey management (`/passkeys`). It uses a **BFF**: the browser talks only to the
 console's own route handlers, which keep every bearer credential — the operator token *and* the
 impersonation support token — in httpOnly cookies and proxy to the Hub (no token in client JS, no CORS).
@@ -75,7 +76,7 @@ runs migrate → seed → the full gate, then stops.
 npm install
 ./scripts/run-local.sh
 ```
-Expected: **195/195 passing** — 113 database isolation/behaviour checks + 82 HTTP end-to-end checks,
+Expected: **210/210 passing** — 121 database isolation/behaviour checks + 89 HTTP end-to-end checks,
 against Postgres 16.
 
 ## Notes

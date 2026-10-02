@@ -23,6 +23,12 @@ const ROLE_MEMBER = 'f0000000-0000-0000-0000-000000000002';
 const ROLE_ADMIN = 'f0000000-0000-0000-0000-000000000001';
 
 const app = buildServer();
+// Rate limiting is ON in the gate. The suite makes ~150 requests, including dozens of logins, which from
+// one address would rightly trip auth_login (10/min). So each injected request comes from its own client
+// address unless a test pins one with `remoteAddress` — the rate-limit tests below do exactly that.
+let ipSeq = 0;
+const rawInject = app.inject.bind(app);
+app.inject = (opts) => rawInject({ remoteAddress: `10.77.${(ipSeq >> 8) & 255}.${ipSeq++ & 255}`, ...opts });
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
 const eq = (a, b, m) => { if (String(a) !== String(b)) throw new Error(`${m}: expected ${b}, got ${a}`); };
@@ -705,6 +711,112 @@ test('flags: paused serves off_value; archived disappears from tenants and canno
   eq((await flagPost(opsTok, `/admin/flags/${QA}/status`, { status: 'active' })).json().error, 'FLAG_ARCHIVED', 'archive is terminal');
   eq((await flagPost(opsTok, `/admin/flags/${QA}/rollouts`, { environment: 'dev', target_type: 'app', app: 'hifz-lms', value: 'wizard' })).json().error,
     'FLAG_ARCHIVED', 'no new rules on an archived flag');
+});
+
+// ---- group 15: rate-limit enforcement ----
+const fromIp = (ip, opts) => app.inject({ ...opts, remoteAddress: ip });
+
+test('ratelimit: login is throttled per client IP — 429 + Retry-After + RateLimit-*; another IP is unaffected', async () => {
+  const try1 = () => fromIp('203.0.113.7', { method: 'POST', url: '/auth/login', payload: { email: 'nobody@example.com', tenant: 'tenant-one' } });
+  const remaining = [];
+  for (let i = 0; i < 10; i++) {
+    const r = await try1();
+    if (r.statusCode === 429) throw new Error(`throttled too early at attempt ${i + 1}`);
+    remaining.push(Number(r.headers['ratelimit-remaining']));
+  }
+  eq(remaining.join(','), '9,8,7,6,5,4,3,2,1,0', 'RateLimit-Remaining counts down');
+  const d = await try1();
+  eq(d.statusCode, 429, '11th attempt throttled'); eq(d.json().error, 'RATE_LIMITED', 'code'); eq(d.json().policy, 'auth_login', 'policy');
+  if (!(Number(d.headers['retry-after']) >= 1)) throw new Error('Retry-After missing');
+  // Failed AND successful attempts both count — otherwise guessing is free. A different client is fine.
+  eq((await fromIp('203.0.113.8', { method: 'POST', url: '/auth/login', payload: { email: 'u1@example.com', tenant: 'tenant-one' } })).statusCode, 200, 'other IP unaffected');
+  // Operator login shares the auth budget for the same address.
+  eq((await fromIp('203.0.113.7', { method: 'POST', url: '/operator/login', payload: { email: 'ops1@platform.example', api_key: 'x' } })).statusCode, 429, 'operator login throttled for that IP too');
+});
+
+test('ratelimit: the BFF\u2019s SIGNED client-IP assertion picks the bucket; an unsigned or forged one is ignored', async () => {
+  const BFF = '10.1.1.1';   // every operator arrives from the console server's one address
+  const signed = (ip, secret = 'dev-bff-secret-change-me') => {
+    const ts = String(Date.now());
+    return { 'x-client-ip': ip, 'x-client-ip-ts': ts, 'x-client-ip-sig': createHmac('sha256', secret).update(`${ip}|${ts}`).digest('hex') };
+  };
+  const attempt = (headers) => fromIp(BFF, { method: 'POST', url: '/operator/login', headers, payload: { email: 'nobody@platform.example', api_key: 'x' } });
+  for (let i = 0; i < 10; i++) eq((await attempt(signed('198.18.0.1'))).statusCode, 401, `client A attempt ${i + 1} reaches the handler`);
+  eq((await attempt(signed('198.18.0.1'))).statusCode, 429, 'client A throttled');
+  eq((await attempt(signed('198.18.0.2'))).statusCode, 401, 'client B, same BFF socket, has its own bucket');
+  // Forged (wrong secret) and unsigned assertions fall back to the socket address — they cannot select a bucket.
+  eq((await attempt(signed('198.18.0.1', 'guess'))).statusCode, 401, 'forged signature ignored (not client A\u2019s exhausted bucket)');
+  eq((await attempt({ 'x-client-ip': '198.18.0.1' })).statusCode, 401, 'unsigned assertion ignored');
+  const stale = signed('198.18.0.1'); stale['x-client-ip-ts'] = String(Date.now() - 120_000);
+  eq((await attempt(stale)).statusCode, 401, 'stale assertion ignored');
+});
+
+test('ratelimit: the login throttle cannot be bypassed by spelling the URL differently', async () => {
+  // Percent-encoding a letter still routes to the login handler; the throttle must follow the ROUTE.
+  for (const url of ['/auth/%6Cogin', '/auth/login?via=query']) {
+    const ip = `203.0.113.${url.length}`;
+    const tryIt = () => fromIp(ip, { method: 'POST', url, payload: { email: 'nobody@example.com', tenant: 'tenant-one' } });
+    for (let i = 0; i < 10; i++) eq((await tryIt()).statusCode, 401, `${url} attempt ${i + 1} reaches the handler`);
+    eq((await tryIt()).statusCode, 429, `${url} is throttled like /auth/login`);
+  }
+});
+
+let t2Bucket;
+test('ratelimit: noisy neighbour — a tight override on tenant-two throttles tenant-two only, and is visible to it', async () => {
+  const o = await flagPost(opsTok, '/admin/rate-limits/overrides', { tenant: 'tenant-two', policy_key: 'api_tenant', limit_per_window: 3, window_seconds: 60, reason: 'abuse investigation' });
+  eq(o.statusCode, 200, 'MFA ops sets an override');
+  const t2 = (await login('u2@example.com', 'tenant-two')).json().token;
+  const mine = await app.inject({ method: 'GET', url: '/my-rate-limits', headers: bearer(t2) });   // hit 1 of 3
+  eq(mine.json().limits.api_tenant.source, 'override', 'tenant sees its own override');
+  eq(mine.json().limits.api_tenant.limit_per_window, 3, 'override limit'); eq(mine.json().limits.api_tenant.burst, 0, 'burst scaled down with the override');
+  eq((await app.inject({ method: 'GET', url: '/me', headers: bearer(t2) })).statusCode, 200, 'hit 2');
+  eq((await app.inject({ method: 'GET', url: '/me', headers: bearer(t2) })).statusCode, 200, 'hit 3');
+  const d = await app.inject({ method: 'GET', url: '/me', headers: bearer(t2) });
+  eq(d.statusCode, 429, 'tenant-two throttled'); eq(d.json().policy, 'api_tenant', 'by the tenant aggregate');
+  const t1 = (await login('u1@example.com', 'tenant-one')).json().token;
+  eq((await app.inject({ method: 'GET', url: '/me', headers: bearer(t1) })).statusCode, 200, 'tenant-one unaffected');
+  const ops = (await app.inject({ method: 'GET', url: '/admin/rate-limits', headers: bearer(opsTok) })).json();
+  const ep = ops.episodes.find((e) => e.tenant_slug === 'tenant-two' && e.policy_key === 'api_tenant');
+  if (!ep) throw new Error('throttling episode not recorded'); t2Bucket = ep.bucket_key;
+  if (!ops.overrides.find((x) => x.tenant_slug === 'tenant-two' && x.created_by_email === 'ops1@platform.example')) throw new Error('override not attributed');
+});
+
+test('ratelimit: an operator can lift the override and clear the bucket (both audited)', async () => {
+  eq((await flagPost(opsTok, '/admin/rate-limits/overrides', { tenant: 'tenant-two', policy_key: 'api_tenant', limit_per_window: 3000, window_seconds: 60, reason: 'investigation closed' })).statusCode, 200, 'newer override supersedes');
+  eq((await flagPost(opsTok, '/admin/rate-limits/reset', { bucket_key: t2Bucket })).json().cleared, 1, 'bucket cleared');
+  const t2 = (await login('u2@example.com', 'tenant-two')).json().token;
+  eq((await app.inject({ method: 'GET', url: '/me', headers: bearer(t2) })).statusCode, 200, 'tenant-two served again');
+  const tail = (await app.inject({ method: 'GET', url: '/admin/audit/tail?chain=platform', headers: bearer(opsTok) })).json().events.map((e) => e.action);
+  for (const a of ['rate_limit.override_set', 'rate_limit.bucket_reset']) if (!tail.includes(a)) throw new Error(`${a} not on the platform chain`);
+});
+
+test('ratelimit: policy edits apply at once; writes need ops|admin + step-up; support may read', async () => {
+  eq((await app.inject({ method: 'GET', url: '/admin/rate-limits', headers: bearer(supTokA) })).statusCode, 200, 'support reads');
+  const body = { limit_per_window: 2, window_seconds: 60, burst: 0 };
+  eq((await flagPost(supTokA, '/admin/rate-limits/policies/webhook_ingress', body)).json().error, 'OPERATOR_ROLE_REQUIRED', 'support refused');
+  eq((await flagPost(await loginOp('ops2@platform.example', 'opk_op5_key_eeeeeeee'), '/admin/rate-limits/policies/webhook_ingress', body)).json().error, 'MFA_REQUIRED', 'pwd-only ops refused');
+  eq((await flagPost(opsTok, '/admin/rate-limits/policies/webhook_ingress', { limit_per_window: 0, window_seconds: 60 })).statusCode, 400, 'invalid limit');
+  eq((await flagPost(opsTok, '/admin/rate-limits/policies/nope', body)).statusCode, 404, 'unknown policy');
+  eq((await flagPost(opsTok, '/admin/rate-limits/policies/webhook_ingress', body)).statusCode, 200, 'tighten webhook ingress');
+  const hook = () => fromIp('198.51.100.9', { method: 'POST', url: '/webhooks/stripe', payload: { id: 'evt_x' }, headers: { 'stripe-signature': 't=1,v1=bad' } });
+  eq((await hook()).statusCode, 401, '#1 reaches the handler (bad signature)');
+  eq((await hook()).statusCode, 401, '#2 reaches the handler');
+  eq((await hook()).statusCode, 429, '#3 stopped before the handler');
+  eq((await flagPost(opsTok, '/admin/rate-limits/policies/webhook_ingress', { limit_per_window: 600, window_seconds: 60, burst: 60 })).statusCode, 200, 'restore');
+});
+
+test('ratelimit: a limiter-store outage FAILS OPEN and is counted where operators can see it', async () => {
+  const broken = { kind: 'broken', hit: async () => { throw new Error('store down'); }, reset: async () => 0, gc: async () => 0 };
+  const app2 = buildServer({ rateLimitStore: broken });
+  try {
+    for (let i = 0; i < 15; i++) {
+      const r = await app2.inject({ method: 'POST', url: '/auth/login', remoteAddress: '192.0.2.1', payload: { email: 'u1@example.com', tenant: 'tenant-one' } });
+      eq(r.statusCode, 200, `login ${i + 1} served despite the outage`);
+    }
+    const s = (await app2.inject({ method: 'GET', url: '/admin/rate-limits', headers: bearer(opsTok) })).json().status;
+    if (!(s.failed_open >= 15)) throw new Error(`failed_open not counted: ${s.failed_open}`);
+    if (!/store down/.test(s.last_error)) throw new Error('last_error not surfaced');
+  } finally { await app2.close(); }
 });
 
 let pass = 0, fail = 0;

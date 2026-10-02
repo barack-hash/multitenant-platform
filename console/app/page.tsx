@@ -39,6 +39,7 @@ export default async function Dashboard() {
           <Link href="/support">→ Support access &amp; impersonation</Link>
           <Link href="/offboarding">→ Tenant offboarding</Link>
           <Link href="/flags">→ Feature flags</Link>
+          <Link href="/rate-limits">→ Rate limits</Link>
         </div>
         <div className="row">
           <Link href="/audit">→ Audit chain viewer</Link>

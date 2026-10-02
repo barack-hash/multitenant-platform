@@ -1,6 +1,7 @@
 // Server-only BFF client for the Hub. The operator token lives in an httpOnly cookie and is attached
 // here — it is NEVER sent to the browser. HUB_URL is a server env var (not exposed to the client).
-import { cookies } from 'next/headers';
+import { cookies, headers as requestHeaders } from 'next/headers';
+import { createHmac } from 'node:crypto';
 
 export const HUB_URL = process.env.HUB_URL || 'http://localhost:3939';
 export const TOKEN_COOKIE = 'op_token';
@@ -26,6 +27,19 @@ export const supportCookie = (value: string, maxAge: number) => ({
 
 export type HubResult = { status: number; body: any };
 
+// Every operator reaches the Hub through this server, i.e. from ONE address — which would put all of
+// them in one per-IP login bucket. So the BFF asserts the browser's address, signed with a secret it
+// shares with the Hub (server-only env; never sent to the browser). The Hub ignores unsigned/forged values.
+const BFF_SECRET = process.env.BFF_SHARED_SECRET || 'dev-bff-secret-change-me';
+async function clientIpHeaders(): Promise<Record<string, string>> {
+  const h = await requestHeaders();
+  const ip = (h.get('x-forwarded-for') || '').split(',')[0].trim() || h.get('x-real-ip') || '';
+  if (!ip) return {};
+  const ts = String(Date.now());
+  return { 'x-client-ip': ip, 'x-client-ip-ts': ts,
+           'x-client-ip-sig': createHmac('sha256', BFF_SECRET).update(`${ip}|${ts}`).digest('hex') };
+}
+
 export async function hubFetch(
   path: string,
   init: RequestInit = {},
@@ -33,6 +47,7 @@ export async function hubFetch(
 ): Promise<HubResult> {
   const headers = new Headers(init.headers);
   if (init.body) headers.set('content-type', 'application/json');
+  for (const [k, v] of Object.entries(await clientIpHeaders())) headers.set(k, v);
   if (opts.auth !== false) {
     // opts.cookie selects WHICH bearer to attach — the operator session by default, or the support
     // (impersonation) token for the /support/* surface.

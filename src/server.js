@@ -11,13 +11,64 @@ import { mintHubToken, verifyHubToken, gucsFromClaims,
 import { generateTotpSecret, verifyTotp, otpauthUri } from './mfa.js';
 import { verifyRegistration, verifyAssertion } from './webauthn.js';
 import { cfg } from './config.js';
+import { createLimiter, storeFromConfig } from './ratelimit.js';
 
 const sha256 = (s) => createHash('sha256').update(s).digest('hex');
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
-export function buildServer() {
-  const app = Fastify({ logger: false });
+export function buildServer(opts = {}) {
+  const app = Fastify({ logger: false, trustProxy: cfg.trustProxy });
+
+  // ---- group 15: rate-limit enforcement (FOUNDATION_14) ----
+  // Pre-auth surfaces are bucketed by client IP (DEPLOYMENT_ARCHITECTURE §3.1: "IP throttling for auth
+  // and webhook ingress"); authenticated requests by principal AND by tenant (noisy-neighbor control,
+  // tunable per tenant via tenant_rate_limit_overrides). opts.rateLimitStore exists for tests.
+  const limiter = createLimiter({ store: opts.rateLimitStore || storeFromConfig(cfg) });
+  const rateGate = async (req, reply, buckets) => {
+    if (!cfg.rateLimitEnabled) return null;
+    const d = await limiter.check(buckets);
+    if (d.limit != null) {
+      reply.header('RateLimit-Policy', d.policy).header('RateLimit-Limit', d.limit)
+        .header('RateLimit-Remaining', d.remaining).header('RateLimit-Reset', Math.ceil(d.resetMs / 1000));
+    }
+    if (d.allowed) return null;
+    reply.header('Retry-After', Math.max(1, Math.ceil(d.retryAfterMs / 1000)));
+    return reply.code(429).send({ error: 'RATE_LIMITED', policy: d.policy, retry_after_ms: d.retryAfterMs });
+  };
+  const principalBuckets = (principal, tenant) => [
+    { policy: 'api_default', key: `api_default:${principal}`, tenant },
+    ...(tenant ? [{ policy: 'api_tenant', key: `api_tenant:tenant:${tenant}`, tenant }] : []),
+  ];
+  const IP_POLICY = {
+    '/auth/login': 'auth_login', '/operator/login': 'auth_login', '/operator/mfa/verify': 'auth_login',
+    '/operator/sso/login': 'auth_login', '/operator/webauthn/login/begin': 'auth_login',
+    '/operator/webauthn/login/finish': 'auth_login',
+    '/webhooks/stripe': 'webhook_ingress', '/dev/simulate-stripe': 'webhook_ingress',
+  };
+  // The client address for IP buckets. A trusted front-end (the console BFF) may assert the address it
+  // saw, signed: HMAC(BFF_SHARED_SECRET, ip|ts), fresh within 60s. Anything unsigned, stale or forged is
+  // ignored and the socket address (or the trusted proxy chain) is used — so a direct caller cannot pick
+  // its own bucket by sending a header.
+  const clientIp = (req) => {
+    const ip = req.headers['x-client-ip'], ts = req.headers['x-client-ip-ts'], sig = req.headers['x-client-ip-sig'];
+    if (typeof ip !== 'string' || typeof ts !== 'string' || typeof sig !== 'string') return req.ip;
+    if (!/^\d+$/.test(ts) || Math.abs(Date.now() - Number(ts)) > 60_000) return req.ip;
+    const want = createHmac('sha256', cfg.bffSecret).update(`${ip}|${ts}`).digest('hex');
+    const a = Buffer.from(sig), b = Buffer.from(want);
+    return a.length === b.length && timingSafeEqual(a, b) ? ip : req.ip;
+  };
+  // onRequest runs before the body is parsed, so a throttled flood costs no JSON parsing either.
+  app.addHook('onRequest', async (req, reply) => {
+    // Key on the route Fastify MATCHED, never the raw URL text: the router decodes the path, so
+    // `/auth/%6Cogin` reaches the login handler while a string compare on req.url would miss it and
+    // skip the throttle entirely (found in self-review; regression-tested).
+    const policy = req.method === 'POST' && IP_POLICY[req.routeOptions?.url];
+    if (policy) return rateGate(req, reply, [{ policy, key: `${policy}:ip:${clientIp(req)}` }]);
+  });
+  const gcTimer = setInterval(() => limiter.gc().catch(() => {}), 60_000);
+  gcTimer.unref();
+  app.addHook('onClose', async () => clearInterval(gcTimer));
 
   // Capture the raw JSON body (webhook HMAC must be over the exact bytes).
   app.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, done) => {
@@ -35,6 +86,7 @@ export function buildServer() {
     if (!m) return reply.code(401).send({ error: 'missing bearer token' });
     try { req.claims = verifyHubToken(m[1]); }
     catch { return reply.code(401).send({ error: 'invalid token' }); }
+    return rateGate(req, reply, principalBuckets(`user:${req.claims.sub}@${req.claims.tid}`, req.claims.tid));
   };
 
   app.get('/healthz', async () => ({ ok: true }));
@@ -208,6 +260,7 @@ export function buildServer() {
     if (!m) return reply.code(401).send({ error: 'missing spoke token' });
     try { req.spoke = verifySpokeToken(m[1]); } catch { return reply.code(401).send({ error: 'invalid spoke token' }); }
     if (!(await sessionActive(req.spoke.sid))) return reply.code(401).send({ error: 'SESSION_REVOKED' });
+    return rateGate(req, reply, principalBuckets(`user:${req.spoke.sub}@${req.spoke.tid}`, req.spoke.tid));
   };
   app.get('/spoke/context', { preHandler: spokeAuth }, async (req) =>
     ({ app_id: req.spoke.app_id, tenant_id: req.spoke.tid, session: req.spoke.sid, active: true }));
@@ -423,7 +476,7 @@ export function buildServer() {
       let claims; try { claims = verifyOperatorToken(m[1]); } catch { return reply.code(401).send({ error: 'invalid operator token' }); }
       if (!(await operatorLive(claims.osid))) return reply.code(401).send({ error: 'OPERATOR_SESSION_INACTIVE' });
       req.operator = { id: claims.sub, role: claims.orole, osid: claims.osid, acr: claims.acr || 'pwd', amr: claims.amr || [] };
-      return;
+      return rateGate(req, reply, principalBuckets(`operator:${claims.sub}`, null));
     }
     if (req.headers['x-admin-token']) {                       // break-glass (env-gated, loudly audited)
       if (cfg.breakGlassEnabled && req.headers['x-admin-token'] === cfg.adminToken) {
@@ -1145,6 +1198,8 @@ export function buildServer() {
     if (!m) return reply.code(401).send({ error: 'missing support token' });
     try { req.claims = verifyHubToken(m[1]); } catch { return reply.code(401).send({ error: 'invalid token' }); }
     if (!req.claims.imp) return reply.code(403).send({ error: 'not an impersonation token' });
+    // Impersonated traffic counts against the target tenant (it IS load on that tenant) and the operator.
+    return rateGate(req, reply, principalBuckets(`operator:${req.claims.imp}`, req.claims.tid));
   };
 
   // The banner context the UI MUST render (C5 visible-banner signal).
@@ -1475,6 +1530,92 @@ export function buildServer() {
         [req.params.key, req.params.id, status]);
       return r.rowCount ? { rule_id: req.params.id, status, environment: r.rows[0].environment } : { __status: 404, error: 'FLAG_RULE_NOT_FOUND' };
     });
+  }));
+
+  // ---- group 15: rate-limit operations (FOUNDATION_14) ----
+
+  // Tenant: its own effective limits (tenant_rate_limit_overrides is Class A tenant-readable by design).
+  app.get('/my-rate-limits', { preHandler: auth }, async (req) => {
+    const shape = (p) => p && { policy_key: p.policy_key, limit_per_window: p.limit_per_window,
+      window_seconds: p.window_seconds, burst: p.burst, source: p.source };
+    return { tenant_id: req.claims.tid, limits: {
+      api_tenant: shape(await limiter.effective('api_tenant', req.claims.tid)),
+      api_default: shape(await limiter.effective('api_default', req.claims.tid)) } };
+  });
+
+  // Operators: catalog, current overrides, recent throttling episodes and the store's health.
+  app.get('/admin/rate-limits', { preHandler: operatorAuth }, async (req, reply) => {
+    if (!await requireRole(req, reply, ['support', 'ops', 'admin'])) return;
+    const out = await withServiceContext('svc_ops', async (c) => ({
+      policies: (await c.query('select policy_key, scope, limit_per_window, window_seconds, burst, description, updated_at from rate_limit_policies order by policy_key')).rows,
+      overrides: (await c.query(
+        `select distinct on (o.tenant_id, o.policy_key) o.id, t.slug tenant_slug, o.policy_key, o.limit_per_window,
+                o.window_seconds, o.reason, o.created_at, op.email created_by_email
+           from tenant_rate_limit_overrides o join tenants t on t.id = o.tenant_id
+           left join platform_operators op on op.id = o.created_by
+          order by o.tenant_id, o.policy_key, o.created_at desc, o.id desc`)).rows,
+      episodes: (await c.query(
+        `select e.policy_key, e.bucket_key, t.slug tenant_slug, e.window_start, e.first_denied_at
+           from rate_limit_episodes e left join tenants t on t.id = e.tenant_id
+          order by e.first_denied_at desc limit 50`)).rows,
+    }));
+    return { enabled: cfg.rateLimitEnabled, status: limiter.status(), ...out };
+  });
+
+  const rlMutation = async (req, reply, fn) => {
+    if (!await requireRole(req, reply, ['ops', 'admin'])) return;
+    if (!await requireMfa(req, reply)) return;
+    const out = await fn();
+    if (out?.__status) return reply.code(out.__status).send({ error: out.error });
+    limiter.invalidate();   // this instance applies the change at once; others within the cache window
+    await auditAppend('svc_ops', { chain_id: 'platform', action: out.__action, actor_ref: req.operator.id,
+      resource_type: 'rate_limit', resource_ref: out.__ref, meta: out.__meta || {} });
+    const { __action, __ref, __meta, ...rest } = out;
+    return rest;
+  };
+  const posInt = (v) => Number.isInteger(v) && v > 0;
+
+  app.post('/admin/rate-limits/policies/:key', { preHandler: operatorAuth }, (req, reply) => rlMutation(req, reply, async () => {
+    const { limit_per_window, window_seconds, burst = 0 } = req.body || {};
+    if (!posInt(limit_per_window) || !posInt(window_seconds) || !Number.isInteger(burst) || burst < 0)
+      return { __status: 400, error: 'limit_per_window, window_seconds (positive integers) and burst (>= 0) are required' };
+    const r = await withServiceContext('svc_ops', async (c) => {
+      const before = (await c.query('select limit_per_window, window_seconds, burst from rate_limit_policies where policy_key=$1', [req.params.key])).rows[0];
+      if (!before) return null;
+      await c.query('update rate_limit_policies set limit_per_window=$2, window_seconds=$3, burst=$4, updated_at=now() where policy_key=$1',
+        [req.params.key, limit_per_window, window_seconds, burst]);
+      return before;
+    });
+    if (!r) return { __status: 404, error: 'RATE_LIMIT_POLICY_NOT_FOUND' };
+    return { policy_key: req.params.key, limit_per_window, window_seconds, burst,
+      __action: 'rate_limit.policy_changed', __ref: req.params.key, __meta: { before: r, after: { limit_per_window, window_seconds, burst } } };
+  }));
+
+  // A tenant override is history: a new row supersedes the previous one (newest wins).
+  app.post('/admin/rate-limits/overrides', { preHandler: operatorAuth }, (req, reply) => rlMutation(req, reply, async () => {
+    const { tenant, policy_key, limit_per_window, window_seconds, reason } = req.body || {};
+    if (!tenant || !policy_key || !reason || !posInt(limit_per_window) || !posInt(window_seconds))
+      return { __status: 400, error: 'tenant, policy_key, reason and positive limit_per_window/window_seconds are required' };
+    const r = await withServiceContext('svc_ops', async (c) => {
+      const t = (await c.query('select id from tenants where slug=$1 and deleted_at is null', [tenant])).rows[0];
+      if (!t) return { e: 'tenant not found' };
+      if (!(await c.query('select 1 from rate_limit_policies where policy_key=$1', [policy_key])).rowCount) return { e: 'RATE_LIMIT_POLICY_NOT_FOUND' };
+      const id = (await c.query(
+        `insert into tenant_rate_limit_overrides(tenant_id, policy_key, limit_per_window, window_seconds, reason, created_by)
+         values($1,$2,$3,$4,$5,$6) returning id`, [t.id, policy_key, limit_per_window, window_seconds, reason, req.operator.id])).rows[0].id;
+      return { id, tid: t.id };
+    });
+    if (r.e) return { __status: 404, error: r.e };
+    return { override_id: r.id, tenant, policy_key, limit_per_window, window_seconds,
+      __action: 'rate_limit.override_set', __ref: `${tenant}:${policy_key}`, __meta: { limit_per_window, window_seconds, reason } };
+  }));
+
+  // Clear one bucket (e.g. a customer's office IP locked out of login). Audited — it bypasses a control.
+  app.post('/admin/rate-limits/reset', { preHandler: operatorAuth }, (req, reply) => rlMutation(req, reply, async () => {
+    const { bucket_key } = req.body || {};
+    if (!bucket_key) return { __status: 400, error: 'bucket_key is required' };
+    const n = await limiter.reset(bucket_key);
+    return { bucket_key, cleared: Number(n) || 0, __action: 'rate_limit.bucket_reset', __ref: bucket_key };
   }));
 
   // Assign a role — RLS enforces the roles.assign permission AND tenant write-eligibility.
