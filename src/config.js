@@ -34,5 +34,25 @@ export const cfg = {
   // The console BFF reaches the Hub from ONE address for every operator, so it asserts the real client
   // IP in a header signed with this shared secret (never trusted unsigned — see clientIp in server.js).
   bffSecret: process.env.BFF_SHARED_SECRET || 'dev-bff-secret-change-me',
+  // Group 16: Supabase Auth establishes identity (DEC-012). Tokens are verified with an algorithm-pinned key:
+  // HS256 with the project JWT secret (legacy/local projects) and/or ES256/RS256 from the project JWKS.
+  // The default secret is the documented local `supabase start` value — refused in prod (see below).
+  supabaseUrl: (process.env.SUPABASE_URL || 'http://127.0.0.1:54321').replace(/\/$/, ''),
+  supabaseJwtSecret: process.env.SUPABASE_JWT_SECRET ?? 'super-secret-jwt-token-with-at-least-32-characters-long',
+  supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || '',   // server-only; used to confirm a claimant's email
+  supabaseAnonKey: process.env.SUPABASE_ANON_KEY || '',                   // PUBLIC by design (browser sign-in)
   port: Number(process.env.PORT || 3000),
 };
+
+// Dev defaults are fine locally and fatal anywhere real: a known HS256 secret lets anyone mint tokens.
+const DEV_DEFAULTS = {
+  HUB_JWT_SECRET: ['jwtSecret', 'dev-only-secret-change-me'],
+  SUPABASE_JWT_SECRET: ['supabaseJwtSecret', 'super-secret-jwt-token-with-at-least-32-characters-long'],
+  BFF_SHARED_SECRET: ['bffSecret', 'dev-bff-secret-change-me'],
+  STRIPE_WEBHOOK_SECRET: ['stripeWebhookSecret', 'whsec_dev'],
+};
+export function assertProductionSecrets(c = cfg) {
+  if (c.platformEnv !== 'prod') return;
+  const bad = Object.entries(DEV_DEFAULTS).filter(([, [k, v]]) => c[k] === v).map(([env]) => env);
+  if (bad.length) throw new Error(`refusing to start in prod with development secrets: ${bad.join(', ')}`);
+}

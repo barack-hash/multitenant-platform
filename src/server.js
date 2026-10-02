@@ -10,7 +10,8 @@ import { mintHubToken, verifyHubToken, gucsFromClaims,
          mintOperatorToken, verifyOperatorToken, mintOperatorMfaToken, verifyOperatorMfaToken } from './tokens.js';
 import { generateTotpSecret, verifyTotp, otpauthUri } from './mfa.js';
 import { verifyRegistration, verifyAssertion } from './webauthn.js';
-import { cfg } from './config.js';
+import { cfg, assertProductionSecrets } from './config.js';
+import { createSupabaseAuth, AuthError } from './supabase.js';
 import { createLimiter, storeFromConfig } from './ratelimit.js';
 
 const sha256 = (s) => createHash('sha256').update(s).digest('hex');
@@ -18,6 +19,7 @@ const sha256 = (s) => createHash('sha256').update(s).digest('hex');
 const HERE = dirname(fileURLToPath(import.meta.url));
 
 export function buildServer(opts = {}) {
+  assertProductionSecrets();
   const app = Fastify({ logger: false, trustProxy: cfg.trustProxy });
 
   // ---- group 15: rate-limit enforcement (FOUNDATION_14) ----
@@ -91,51 +93,91 @@ export function buildServer(opts = {}) {
 
   app.get('/healthz', async () => ({ ok: true }));
 
-  // Authentication is assumed done upstream (Supabase). Here the Hub verifies the user has an
-  // active membership, loads their effective permissions, and mints the tenant-trust token.
+  // ---- group 16: real authentication (DEC-012, FOUNDATION_15) ----
+  // Supabase establishes WHO (a verified access token's `sub`); the Hub decides WHAT. The old email-only
+  // stub — which minted a tenant token for whoever NAMED an email — is gone.
+  // opts.supabaseFetch / opts.supabaseServiceRoleKey exist for tests (a stand-in Supabase Admin API + JWKS).
+  const supabase = createSupabaseAuth({ url: cfg.supabaseUrl, jwtSecret: cfg.supabaseJwtSecret,
+    serviceRoleKey: opts.supabaseServiceRoleKey ?? cfg.supabaseServiceRoleKey, fetchImpl: opts.supabaseFetch || fetch });
+
+  // Map a verified Supabase subject to a Hub identity: already bound, or the CLAIM of a pending
+  // invitation — allowed only for an email the Supabase Admin API itself reports as confirmed.
+  const resolveIdentity = async (claims) => {
+    const bound = (await withServiceContext('svc_identity', (c) => c.query(
+      "select id, status, deleted_at from user_identities where auth_provider='supabase' and auth_subject=$1", [claims.sub]))).rows[0];
+    if (bound) return bound.status === 'active' && !bound.deleted_at ? { id: bound.id } : { code: 403, error: 'IDENTITY_DISABLED' };
+    const { email, confirmed } = await supabase.verifiedEmail(claims.sub);
+    if (!email) return { code: 401, error: 'IDENTITY_NOT_PROVISIONED' };
+    if (!confirmed) return { code: 403, error: 'EMAIL_NOT_VERIFIED' };
+    // Atomic: only an unclaimed invitation matches, so two racing first-logins cannot both bind it, and a
+    // bound identity is never touched (the DB trigger refuses a rebind regardless).
+    const claimed = (await withServiceContext('svc_identity', (c) => c.query(
+      `update user_identities set auth_provider='supabase', auth_subject=$1, updated_at=now(), version=version+1
+        where auth_provider='invite' and primary_email=$2 and status='active' and deleted_at is null returning id`,
+      [claims.sub, email]))).rows[0];
+    if (!claimed) return { code: 401, error: 'IDENTITY_NOT_PROVISIONED' };
+    await auditAppend('svc_ops', { chain_id: 'platform', action: 'identity.claimed', actor_type: 'user', actor_ref: claimed.id,
+      resource_type: 'user_identity', resource_ref: claimed.id, meta: { provider: 'supabase' } });
+    return { id: claimed.id, claimed: true };
+  };
+
+  // Exchange a Supabase access token for a Hub tenant token (MASTER_PLAN §5 claims, 900s).
   app.post('/auth/login', async (req, reply) => {
-    const { email, tenant } = req.body || {};
-    if (!email || !tenant) return reply.code(400).send({ error: 'email and tenant are required' });
+    const { access_token, tenant } = req.body || {};
+    if (!access_token || !tenant) return reply.code(400).send({ error: 'access_token (a Supabase session token) and tenant are required' });
+    let claims, identity;
+    try {
+      claims = await supabase.verify(access_token);
+      identity = await resolveIdentity(claims);
+    } catch (e) {
+      if (!(e instanceof AuthError)) throw e;
+      const unavailable = /UNAVAILABLE|UNCONFIGURED/.test(e.code);
+      return reply.code(unavailable ? 503 : 401).send({ error: e.code });
+    }
+    if (identity.error) return reply.code(identity.code).send({ error: identity.error });
 
-    const found = await withServiceContext('svc_ops', async (c) => {
-      const u = await c.query('select id from user_identities where primary_email=$1 and status=$2 and deleted_at is null', [email, 'active']);
+    const found = await withServiceContext('svc_identity', async (c) => {
       const t = await c.query('select id, status, billing_status, entitlement_snapshot_version ev from tenants where slug=$1 and deleted_at is null', [tenant]);
-      if (!u.rowCount || !t.rowCount) return null;
-      const userId = u.rows[0].id, tenantId = t.rows[0].id;
-      const m = await c.query('select id from tenant_memberships where tenant_id=$1 and user_id=$2 and status=$3 and deleted_at is null', [tenantId, userId, 'active']);
+      if (!t.rowCount) return null;
+      const tenantId = t.rows[0].id;
+      // An invited membership becomes active on the invitee's first login to that tenant.
+      const m = await c.query(
+        `select id, status from tenant_memberships where tenant_id=$1 and user_id=$2 and status in ('active','invited') and deleted_at is null`,
+        [tenantId, identity.id]);
       if (!m.rowCount) return null;
-      const membershipId = m.rows[0].id;
-      const perms = await c.query(
-        `select distinct p.permission_key
-           from tenant_user_roles tur
-           join role_permissions rp on rp.role_id = tur.role_id
-           join permissions p on p.id = rp.permission_id
-          where tur.tenant_id=$1 and tur.membership_id=$2 and tur.deleted_at is null`, [tenantId, membershipId]);
-      const roles = await c.query(
-        `select r.role_key from tenant_user_roles tur join roles r on r.id=tur.role_id
-          where tur.tenant_id=$1 and tur.membership_id=$2 and tur.deleted_at is null`, [tenantId, membershipId]);
-      const tw = t.rows[0].status === 'active' && t.rows[0].billing_status !== 'locked';
-      return {
-        userId, tenantId, membershipId, tw, ev: t.rows[0].ev,
-        permissions: perms.rows.map((r) => r.permission_key),
-        roles: roles.rows.map((r) => r.role_key),
-      };
+      let activated = false;
+      if (m.rows[0].status === 'invited') {
+        await c.query("update tenant_memberships set status='active', activated_at=now(), updated_at=now() where id=$1", [m.rows[0].id]);
+        activated = true;
+      }
+      return { tenantId, membershipId: m.rows[0].id, tenantRow: t.rows[0], activated };
     });
+    if (!found) return reply.code(401).send({ error: 'no active membership in that tenant' });
 
-    if (!found) return reply.code(401).send({ error: 'invalid login or no active membership in that tenant' });
-    // Create the root (hub) session; id == root_session_id.
+    const grants = await withServiceContext('svc_ops', async (c) => ({
+      permissions: (await c.query(
+        `select distinct p.permission_key from tenant_user_roles tur
+           join role_permissions rp on rp.role_id = tur.role_id join permissions p on p.id = rp.permission_id
+          where tur.tenant_id=$1 and tur.membership_id=$2 and tur.deleted_at is null`, [found.tenantId, found.membershipId])).rows.map((r) => r.permission_key),
+      roles: (await c.query(
+        `select r.role_key from tenant_user_roles tur join roles r on r.id=tur.role_id
+          where tur.tenant_id=$1 and tur.membership_id=$2 and tur.deleted_at is null`, [found.tenantId, found.membershipId])).rows.map((r) => r.role_key),
+    }));
+    const tw = found.tenantRow.status === 'active' && found.tenantRow.billing_status !== 'locked';
     const sid = randomUUID();
     await withServiceContext('svc_session', (c) => c.query(
       `insert into sessions(id, tenant_id, user_id, membership_id, kind, root_session_id, entitlement_snapshot_version, expires_at)
        values($1,$2,$3,$4,'hub',$1,$5, now() + interval '900 seconds')`,
-      [sid, found.tenantId, found.userId, found.membershipId, found.ev]));
-    const token = mintHubToken({
-      sub: found.userId, tid: found.tenantId, mid: found.membershipId,
-      permissions: found.permissions, roles: found.roles, ent_v: found.ev, tw: found.tw,
-      sid, root_sid: sid,
-    });
-    return { token, token_type: 'Bearer', expires_in: cfg.accessTtlSec };
+      [sid, found.tenantId, identity.id, found.membershipId, found.tenantRow.ev]));
+    const token = mintHubToken({ sub: identity.id, tid: found.tenantId, mid: found.membershipId,
+      permissions: grants.permissions, roles: grants.roles, ent_v: found.tenantRow.ev, tw, sid, root_sid: sid });
+    return { token, token_type: 'Bearer', expires_in: cfg.accessTtlSec,
+      ...(identity.claimed ? { identity_claimed: true } : {}), ...(found.activated ? { membership_activated: true } : {}) };
   });
+
+  // Public, non-secret auth configuration for front-ends (where to sign in with Supabase).
+  // The anon key is a public, low-privilege key Supabase designs to ship to browsers; never the service-role key.
+  app.get('/auth/config', async () => ({ supabase_url: cfg.supabaseUrl, issuer: `${cfg.supabaseUrl}/auth/v1`, anon_key: cfg.supabaseAnonKey || null }));
 
   // Current user's own identity (via the RLS-scoped v_me projection).
   app.get('/me', { preHandler: auth }, async (req) =>
@@ -1617,6 +1659,35 @@ export function buildServer(opts = {}) {
     const n = await limiter.reset(bucket_key);
     return { bucket_key, cleared: Number(n) || 0, __action: 'rate_limit.bucket_reset', __ref: bucket_key };
   }));
+
+  // ---- group 16: invitations — the only way a new Supabase user gains a membership ----
+  // A tenant admin (memberships.manage) invites an email. If no Hub identity has that email, an UNCLAIMED
+  // one is provisioned (auth_provider='invite'); the invitee claims it on first login with a verified
+  // email. Requires tenant write-eligibility, so impersonation (tw=false) and frozen tenants cannot invite.
+  // The response is the same whether or not the email already had an identity (no account enumeration).
+  app.post('/tenant/invitations', { preHandler: auth }, async (req, reply) => {
+    const { email, role_key = null } = req.body || {};
+    if (typeof email !== 'string' || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return reply.code(400).send({ error: 'a valid email is required' });
+    if (!(req.claims.permissions || []).includes('memberships.manage')) return reply.code(403).send({ error: 'PERMISSION_REQUIRED', permission: 'memberships.manage' });
+    if (!req.claims.tw) return reply.code(403).send({ error: 'TENANT_WRITES_DISABLED' });
+    const tenantId = req.claims.tid;
+    const roleId = role_key
+      ? (await withServiceContext('svc_authz', (c) => c.query('select id from roles where role_key=$1', [role_key]))).rows[0]?.id
+      : null;
+    if (role_key && !roleId) return reply.code(400).send({ error: 'unknown role_key' });
+
+    // app.invite_to_tenant converges concurrent invitations on one identity + one membership (unique
+    // indexes + ON CONFLICT), so two admins clicking at once cannot create duplicates.
+    const row = (await withServiceContext('svc_identity', (c) => c.query(
+      'select * from app.invite_to_tenant($1,$2,$3)', [tenantId, email, req.claims.sub]))).rows[0];
+    const out = { membershipId: row.membership_id, status: row.status, created: row.created };
+    if (out.created && roleId) await withServiceContext('svc_authz', (c) => c.query(
+      'insert into tenant_user_roles(tenant_id, membership_id, role_id) values($1,$2,$3)', [tenantId, out.membershipId, roleId]));
+    if (out.created) await auditAppend('svc_ops', { chain_id: tenantId, tenant: tenantId, action: 'membership.invited',
+      actor_type: 'user', actor_ref: req.claims.sub, resource_type: 'tenant_membership', resource_ref: out.membershipId,
+      meta: { role_key } });   // the email is PII: kept out of the hash-chained ledger (DEC-015)
+    return { membership_id: out.membershipId, status: out.status };
+  });
 
   // Assign a role — RLS enforces the roles.assign permission AND tenant write-eligibility.
   app.post('/roles/assign', { preHandler: auth }, async (req, reply) => {

@@ -9,9 +9,9 @@ on conflict (id) do nothing;
 
 -- Users (identity principals)
 insert into user_identities (id, auth_provider, auth_subject, primary_email, display_name) values
-  ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa','supabase','sub-u1','u1@example.com','User One (T1 member)'),
-  ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb','supabase','sub-u2','u2@example.com','User Two (T2 member)'),
-  ('cccccccc-cccc-cccc-cccc-cccccccccccc','supabase','sub-u3','u3@example.com','User Three (T1 admin)')
+  ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa','supabase','5b000000-0000-4000-8000-000000000001','u1@example.com','User One (T1 member)'),
+  ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb','supabase','5b000000-0000-4000-8000-000000000002','u2@example.com','User Two (T2 member)'),
+  ('cccccccc-cccc-cccc-cccc-cccccccccccc','supabase','5b000000-0000-4000-8000-000000000003','u3@example.com','User Three (T1 admin)')
 on conflict (id) do nothing;
 
 -- Memberships (id == membership_id)

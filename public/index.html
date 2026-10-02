@@ -44,15 +44,12 @@
   <div class="grid">
     <div class="card">
       <h2>Sign in</h2>
-      <div class="presets">
-        <button class="ghost" onclick="preset('u1@example.com','tenant-one')">U1 · member · tenant-one</button>
-        <button class="ghost" onclick="preset('u3@example.com','tenant-one')">U3 · admin · tenant-one</button>
-        <button class="ghost" onclick="preset('u2@example.com','tenant-two')">U2 · member · tenant-two</button>
-        <button class="ghost" onclick="preset('u1@example.com','tenant-two')">U1 → tenant-two (denied)</button>
-      </div>
-      <label>Email</label><input id="email" value="u1@example.com" />
+      <p class="sub" style="margin-top:0">Authenticated by <b>Supabase Auth</b>; the Hub verifies the Supabase session token and mints its own tenant token (DEC-012). A new user needs a tenant-admin invitation and a confirmed email.</p>
+      <label>Email</label><input id="email" value="" placeholder="you@example.com" />
+      <label>Password</label><input id="password" type="password" value="" />
       <label>Tenant slug</label><input id="tenant" value="tenant-one" />
-      <button onclick="login()">Log in</button>
+      <button onclick="login()">Sign in</button>
+      <button class="ghost" onclick="signup()">Create Supabase account</button>
       <div id="loginStatus" class="status"></div>
     </div>
 
@@ -120,17 +117,34 @@
 <script>
 let token = null;
 const $ = (id) => document.getElementById(id);
-function preset(e,t){ $('email').value=e; $('tenant').value=t; login(); }
-
+let supa = null;
+async function supaConfig(){ if(!supa) supa = await (await fetch('/auth/config')).json(); return supa; }
+async function supabaseAuth(path, body){
+  const c = await supaConfig();
+  if(!c.anon_key) throw new Error('SUPABASE_ANON_KEY is not configured on the Hub');
+  const r = await fetch(c.supabase_url+'/auth/v1/'+path,{method:'POST',headers:{'content-type':'application/json',apikey:c.anon_key},body:JSON.stringify(body)});
+  const j = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(j.error_description||j.msg||j.error||('Supabase HTTP '+r.status));
+  return j;
+}
+async function signup(){
+  $('loginStatus').className='status'; $('loginStatus').textContent='…';
+  try{ await supabaseAuth('signup',{email:$('email').value,password:$('password').value});
+       $('loginStatus').className='status ok'; $('loginStatus').textContent='✓ Supabase account created — confirm the email, then sign in.'; }
+  catch(e){ $('loginStatus').className='status err'; $('loginStatus').textContent='✗ '+e.message; }
+}
 async function login(){
   const email=$('email').value, tenant=$('tenant').value;
   $('loginStatus').textContent='…'; $('loginStatus').className='status';
   try{
-    const r = await fetch('/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email,tenant})});
+    // 1) Supabase authenticates (password grant) → a Supabase session token.
+    const s = await supabaseAuth('token?grant_type=password',{email,password:$('password').value});
+    // 2) The Hub verifies that token and decides tenant access.
+    const r = await fetch('/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({access_token:s.access_token,tenant})});
     const j = await r.json();
     if(!r.ok){ token=null; $('loginStatus').className='status err'; $('loginStatus').textContent='✗ '+(j.error||r.status); render(null); return; }
     token=j.token;
-    $('loginStatus').className='status ok'; $('loginStatus').textContent='✓ signed in as '+email+' @ '+tenant;
+    $('loginStatus').className='status ok'; $('loginStatus').textContent='✓ signed in as '+email+' @ '+tenant+(j.identity_claimed?' — invitation claimed':'')+(j.membership_activated?', membership activated':'');
     render(decode(token)); await load();
   }catch(e){ $('loginStatus').className='status err'; $('loginStatus').textContent='✗ '+e.message; }
 }

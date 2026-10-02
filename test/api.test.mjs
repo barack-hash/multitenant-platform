@@ -2,7 +2,8 @@
 // enforces the same isolation the DB gate proves, through real login and endpoints.
 import { buildServer } from '../src/server.js';
 import { closePools } from '../src/db.js';
-import { createHmac } from 'node:crypto';
+import { createHmac, randomUUID, generateKeyPairSync } from 'node:crypto';
+import jwt from 'jsonwebtoken';
 import { totp } from '../src/mfa.js';
 import { makeCredential } from '../src/webauthn.js';
 import { cfg } from '../src/config.js';
@@ -22,7 +23,29 @@ const U2 = 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb';
 const ROLE_MEMBER = 'f0000000-0000-0000-0000-000000000002';
 const ROLE_ADMIN = 'f0000000-0000-0000-0000-000000000001';
 
-const app = buildServer();
+// ---- Supabase stand-in (group 16). Tokens are signed exactly as a local `supabase start` signs them
+// (HS256, project secret, iss <url>/auth/v1, aud/role authenticated). The Admin API (used only when a new
+// Supabase user CLAIMS an invitation) and the JWKS endpoint are served by this fake fetch.
+const SUBS = { 'u1@example.com': '5b000000-0000-4000-8000-000000000001', 'u2@example.com': '5b000000-0000-4000-8000-000000000002',
+  'u3@example.com': '5b000000-0000-4000-8000-000000000003', 'u4@example.com': '5b000000-0000-4000-8000-000000000004' };
+const ISS = `${cfg.supabaseUrl}/auth/v1`;
+const supaUsers = new Map();            // sub -> { email, email_confirmed_at }
+const jwksKeys = [];
+const supaToken = (email, { sub, claims = {}, secret = cfg.supabaseJwtSecret, opts = {} } = {}) => jwt.sign(
+  { sub: sub || SUBS[email] || randomUUID(), email, role: 'authenticated', aud: 'authenticated', ...claims },
+  secret, { algorithm: 'HS256', issuer: ISS, expiresIn: 3600, ...opts });
+const fakeRes = (status, body) => ({ ok: status < 300, status, json: async () => body });
+const supabaseFetch = async (url, init = {}) => {
+  const m = /\/auth\/v1\/admin\/users\/([0-9a-f-]+)$/.exec(url);
+  if (m) {
+    if (init.headers?.authorization !== 'Bearer test-service-role') return fakeRes(401, { msg: 'bad key' });
+    const u = supaUsers.get(m[1]);
+    return u ? fakeRes(200, { id: m[1], ...u }) : fakeRes(404, {});
+  }
+  if (url === `${ISS}/.well-known/jwks.json`) return fakeRes(200, { keys: jwksKeys });
+  return fakeRes(404, {});
+};
+const app = buildServer({ supabaseFetch, supabaseServiceRoleKey: 'test-service-role' });
 // Rate limiting is ON in the gate. The suite makes ~150 requests, including dozens of logins, which from
 // one address would rightly trip auth_login (10/min). So each injected request comes from its own client
 // address unless a test pins one with `remoteAddress` — the rate-limit tests below do exactly that.
@@ -32,7 +55,7 @@ app.inject = (opts) => rawInject({ remoteAddress: `10.77.${(ipSeq >> 8) & 255}.$
 const tests = [];
 const test = (name, fn) => tests.push({ name, fn });
 const eq = (a, b, m) => { if (String(a) !== String(b)) throw new Error(`${m}: expected ${b}, got ${a}`); };
-const login = (email, tenant) => app.inject({ method: 'POST', url: '/auth/login', payload: { email, tenant } });
+const login = (email, tenant) => app.inject({ method: 'POST', url: '/auth/login', payload: { access_token: supaToken(email), tenant } });
 const bearer = (t) => ({ authorization: `Bearer ${t}` });
 
 let token1, token2, token3;
@@ -717,7 +740,7 @@ test('flags: paused serves off_value; archived disappears from tenants and canno
 const fromIp = (ip, opts) => app.inject({ ...opts, remoteAddress: ip });
 
 test('ratelimit: login is throttled per client IP — 429 + Retry-After + RateLimit-*; another IP is unaffected', async () => {
-  const try1 = () => fromIp('203.0.113.7', { method: 'POST', url: '/auth/login', payload: { email: 'nobody@example.com', tenant: 'tenant-one' } });
+  const try1 = () => fromIp('203.0.113.7', { method: 'POST', url: '/auth/login', payload: { access_token: supaToken('nobody@example.com'), tenant: 'tenant-one' } });
   const remaining = [];
   for (let i = 0; i < 10; i++) {
     const r = await try1();
@@ -729,7 +752,7 @@ test('ratelimit: login is throttled per client IP — 429 + Retry-After + RateLi
   eq(d.statusCode, 429, '11th attempt throttled'); eq(d.json().error, 'RATE_LIMITED', 'code'); eq(d.json().policy, 'auth_login', 'policy');
   if (!(Number(d.headers['retry-after']) >= 1)) throw new Error('Retry-After missing');
   // Failed AND successful attempts both count — otherwise guessing is free. A different client is fine.
-  eq((await fromIp('203.0.113.8', { method: 'POST', url: '/auth/login', payload: { email: 'u1@example.com', tenant: 'tenant-one' } })).statusCode, 200, 'other IP unaffected');
+  eq((await fromIp('203.0.113.8', { method: 'POST', url: '/auth/login', payload: { access_token: supaToken('u1@example.com'), tenant: 'tenant-one' } })).statusCode, 200, 'other IP unaffected');
   // Operator login shares the auth budget for the same address.
   eq((await fromIp('203.0.113.7', { method: 'POST', url: '/operator/login', payload: { email: 'ops1@platform.example', api_key: 'x' } })).statusCode, 429, 'operator login throttled for that IP too');
 });
@@ -755,7 +778,7 @@ test('ratelimit: the login throttle cannot be bypassed by spelling the URL diffe
   // Percent-encoding a letter still routes to the login handler; the throttle must follow the ROUTE.
   for (const url of ['/auth/%6Cogin', '/auth/login?via=query']) {
     const ip = `203.0.113.${url.length}`;
-    const tryIt = () => fromIp(ip, { method: 'POST', url, payload: { email: 'nobody@example.com', tenant: 'tenant-one' } });
+    const tryIt = () => fromIp(ip, { method: 'POST', url, payload: { access_token: supaToken('nobody@example.com'), tenant: 'tenant-one' } });
     for (let i = 0; i < 10; i++) eq((await tryIt()).statusCode, 401, `${url} attempt ${i + 1} reaches the handler`);
     eq((await tryIt()).statusCode, 429, `${url} is throttled like /auth/login`);
   }
@@ -807,16 +830,107 @@ test('ratelimit: policy edits apply at once; writes need ops|admin + step-up; su
 
 test('ratelimit: a limiter-store outage FAILS OPEN and is counted where operators can see it', async () => {
   const broken = { kind: 'broken', hit: async () => { throw new Error('store down'); }, reset: async () => 0, gc: async () => 0 };
-  const app2 = buildServer({ rateLimitStore: broken });
+  const app2 = buildServer({ rateLimitStore: broken, supabaseFetch, supabaseServiceRoleKey: 'test-service-role' });
   try {
     for (let i = 0; i < 15; i++) {
-      const r = await app2.inject({ method: 'POST', url: '/auth/login', remoteAddress: '192.0.2.1', payload: { email: 'u1@example.com', tenant: 'tenant-one' } });
+      const r = await app2.inject({ method: 'POST', url: '/auth/login', remoteAddress: '192.0.2.1', payload: { access_token: supaToken('u1@example.com'), tenant: 'tenant-one' } });
       eq(r.statusCode, 200, `login ${i + 1} served despite the outage`);
     }
     const s = (await app2.inject({ method: 'GET', url: '/admin/rate-limits', headers: bearer(opsTok) })).json().status;
     if (!(s.failed_open >= 15)) throw new Error(`failed_open not counted: ${s.failed_open}`);
     if (!/store down/.test(s.last_error)) throw new Error('last_error not surfaced');
   } finally { await app2.close(); }
+});
+
+// ---- group 16: real authentication (Supabase, DEC-012) ----
+const exchange = (access_token, tenant = 'tenant-one') => app.inject({ method: 'POST', url: '/auth/login', payload: { access_token, tenant } });
+
+test('auth: the email-only login is gone — naming an email no longer mints a token', async () => {
+  const r = await app.inject({ method: 'POST', url: '/auth/login', payload: { email: 'u3@example.com', tenant: 'tenant-one' } });
+  eq(r.statusCode, 400, 'email-only request refused'); if (r.json().token) throw new Error('a token was minted');
+});
+
+test('auth: only a genuine, current, correctly-addressed Supabase token is accepted', async () => {
+  eq((await exchange(supaToken('u1@example.com'))).statusCode, 200, 'valid HS256 token');
+  const good = supaToken('u1@example.com');
+  const [h, p, sig] = good.split('.');
+  const forged = Buffer.from(JSON.stringify({ ...JSON.parse(Buffer.from(p, 'base64url')), sub: SUBS['u3@example.com'] })).toString('base64url');
+  eq((await exchange(`${h}.${forged}.${sig}`)).json().error, 'SUPABASE_TOKEN_INVALID', 'payload swapped to another user (signature no longer matches)');
+  eq((await exchange(supaToken('u1@example.com', { secret: 'not-the-project-secret-but-32-chars-long!!' }))).json().error, 'SUPABASE_TOKEN_INVALID', 'wrong signing secret');
+  eq((await exchange(supaToken('u1@example.com', { opts: { expiresIn: -120 } }))).json().error, 'SUPABASE_TOKEN_INVALID', 'expired beyond the 60s skew');
+  eq((await exchange(supaToken('u1@example.com', { opts: { issuer: 'https://evil.example/auth/v1' } }))).json().error, 'SUPABASE_TOKEN_INVALID', 'another project / issuer');
+  eq((await exchange(supaToken('u1@example.com', { claims: { aud: 'other' } }))).json().error, 'SUPABASE_TOKEN_INVALID', 'wrong audience');
+  eq((await exchange('not.a.jwt')).statusCode, 401, 'garbage');
+});
+
+test('auth: Supabase’s own anon/service_role keys and anonymous users can never log in as a user', async () => {
+  for (const role of ['anon', 'service_role'])
+    eq((await exchange(supaToken('u1@example.com', { claims: { role } }))).json().error, 'SUPABASE_ROLE_INVALID', `${role} key refused`);
+  eq((await exchange(supaToken('u1@example.com', { claims: { is_anonymous: true } }))).json().error, 'SUPABASE_ANONYMOUS_REFUSED', 'anonymous refused');
+});
+
+test('auth: asymmetric keys via JWKS work; unknown kid, algorithm confusion and alg=none are refused', async () => {
+  const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  jwksKeys.push({ ...publicKey.export({ format: 'jwk' }), kid: 'kid-es256-1', alg: 'ES256', use: 'sig' });
+  const claims = { sub: SUBS['u1@example.com'], role: 'authenticated', aud: 'authenticated' };
+  const es = (kid) => jwt.sign(claims, privateKey, { algorithm: 'ES256', issuer: ISS, expiresIn: 600, keyid: kid });
+  eq((await exchange(es('kid-es256-1'))).statusCode, 200, 'ES256 token verified against the JWKS');
+  eq((await exchange(es('kid-unknown'))).json().error, 'SUPABASE_UNKNOWN_KEY', 'unknown kid');
+  // Algorithm confusion: an HS256 token "signed" with the PUBLIC key must not verify.
+  const pem = publicKey.export({ type: 'spki', format: 'pem' });
+  const confused = jwt.sign(claims, pem, { algorithm: 'HS256', issuer: ISS, expiresIn: 600, keyid: 'kid-es256-1' });
+  eq((await exchange(confused)).json().error, 'SUPABASE_TOKEN_INVALID', 'HS256-with-public-key refused');
+  const none = `${Buffer.from(JSON.stringify({ alg: 'none', typ: 'JWT' })).toString('base64url')}.${Buffer.from(JSON.stringify({ ...claims, iss: ISS, exp: Math.floor(Date.now() / 1000) + 600 })).toString('base64url')}.`;
+  eq((await exchange(none)).json().error, 'SUPABASE_ALG_NOT_ALLOWED', 'alg=none refused');
+});
+
+const NEW_SUB = randomUUID();
+test('auth: invite → verified first login CLAIMS the identity and activates the membership', async () => {
+  const admin = (await login('u3@example.com', 'tenant-one')).json().token;
+  const inv = await app.inject({ method: 'POST', url: '/tenant/invitations', headers: bearer(admin), payload: { email: 'newbie@example.com', role_key: 'member' } });
+  eq(inv.statusCode, 200, 'tenant admin invites'); eq(inv.json().status, 'invited', 'invited');
+  eq((await exchange(supaToken('newbie@example.com', { sub: NEW_SUB }))).json().error, 'SUPABASE_USER_NOT_FOUND', 'no Supabase user yet → no claim');
+  supaUsers.set(NEW_SUB, { email: 'newbie@example.com', email_confirmed_at: new Date().toISOString() });
+  const first = await exchange(supaToken('newbie@example.com', { sub: NEW_SUB }));
+  eq(first.statusCode, 200, 'first login'); eq(first.json().identity_claimed, true, 'identity claimed'); eq(first.json().membership_activated, true, 'membership activated');
+  eq((await app.inject({ method: 'GET', url: '/me', headers: bearer(first.json().token) })).json().me.primary_email, 'newbie@example.com', '/me is the invitee');
+  const second = await exchange(supaToken('newbie@example.com', { sub: NEW_SUB }));
+  eq(second.statusCode, 200, 'second login via the binding'); eq(second.json().identity_claimed, undefined, 'no second claim');
+  eq((await exchange(supaToken('newbie@example.com', { sub: NEW_SUB }), 'tenant-two')).statusCode, 401, 'no membership in another tenant');
+});
+
+test('auth: an unverified email cannot claim; a second Supabase account cannot take a claimed identity', async () => {
+  const admin = (await login('u3@example.com', 'tenant-one')).json().token;
+  await app.inject({ method: 'POST', url: '/tenant/invitations', headers: bearer(admin), payload: { email: 'pending@example.com' } });
+  const sub = randomUUID();
+  supaUsers.set(sub, { email: 'pending@example.com', email_confirmed_at: null });
+  eq((await exchange(supaToken('pending@example.com', { sub }))).json().error, 'EMAIL_NOT_VERIFIED', 'unverified refused');
+  supaUsers.set(sub, { email: 'pending@example.com', email_confirmed_at: new Date().toISOString() });
+  eq((await exchange(supaToken('pending@example.com', { sub }))).statusCode, 200, 'claims once verified');
+  // An attacker who registers a different Supabase account with the victim's email (e.g. after the victim
+  // changed theirs) — or presents a token whose email CLAIM says so — gets nothing: the identity is bound.
+  const attacker = randomUUID();
+  supaUsers.set(attacker, { email: 'newbie@example.com', email_confirmed_at: new Date().toISOString() });
+  eq((await exchange(supaToken('newbie@example.com', { sub: attacker }))).json().error, 'IDENTITY_NOT_PROVISIONED', 'claimed identity not re-bindable');
+  // The token's own email claim is never trusted for claiming — only the Admin API's record is.
+  const liar = randomUUID();
+  supaUsers.set(liar, { email: 'liar@example.com', email_confirmed_at: new Date().toISOString() });
+  await app.inject({ method: 'POST', url: '/tenant/invitations', headers: bearer(admin), payload: { email: 'target@example.com' } });
+  eq((await exchange(supaToken('target@example.com', { sub: liar }))).json().error, 'IDENTITY_NOT_PROVISIONED', 'token email claim ignored');
+});
+
+test('auth: inviting needs memberships.manage and a write-eligible token; existing accounts are not revealed', async () => {
+  // u2 is a plain member of tenant-two (u1 is promoted to tenant_admin earlier in this suite).
+  const member = (await login('u2@example.com', 'tenant-two')).json().token;
+  const denied = await app.inject({ method: 'POST', url: '/tenant/invitations', headers: bearer(member), payload: { email: 'x@example.com' } });
+  eq(denied.statusCode, 403, 'member cannot invite'); eq(denied.json().error, 'PERMISSION_REQUIRED', 'code');
+  const admin = (await login('u3@example.com', 'tenant-one')).json().token;
+  const a = await app.inject({ method: 'POST', url: '/tenant/invitations', headers: bearer(admin), payload: { email: 'u2@example.com' } });
+  const b = await app.inject({ method: 'POST', url: '/tenant/invitations', headers: bearer(admin), payload: { email: 'brand-new@example.com' } });
+  eq(Object.keys(a.json()).sort().join(','), Object.keys(b.json()).sort().join(','), 'same response shape for existing and new emails');
+  eq(a.json().status, 'invited', 'existing account invited'); eq(b.json().status, 'invited', 'new email invited');
+  eq((await app.inject({ method: 'POST', url: '/tenant/invitations', headers: bearer(admin), payload: { email: 'not-an-email' } })).statusCode, 400, 'bad email');
+  eq((await app.inject({ method: 'POST', url: '/tenant/invitations', headers: bearer(admin), payload: { email: 'r@example.com', role_key: 'god' } })).statusCode, 400, 'unknown role');
 });
 
 let pass = 0, fail = 0;

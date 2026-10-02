@@ -100,6 +100,9 @@ echo "== DB isolation gate (group 15 · rate-limit enforcement) =="
 node test/ratelimit.test.mjs || RC=1
 node test/ratelimit.upstash.test.mjs || RC=1
 echo ""
+echo "== DB isolation gate (group 16 · identity binding / Supabase auth) =="
+node test/identity.test.mjs || RC=1
+echo ""
 echo "== API gate =="
 node test/api.test.mjs || RC=1
 
